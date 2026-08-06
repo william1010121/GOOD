@@ -15,6 +15,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 
@@ -331,6 +332,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    // Optional finite-epoch export for exact cross-node merge. Disabled by default.
+    const char *exact_epoch_dir = getenv("EXACT_EPOCH_DIR");
+    uint64_t exact_dump_limit = 0;
+    if (const char *dump_text = getenv("EXACT_DUMP_NONCES")) {
+        exact_dump_limit = parse_positive_u64(dump_text, "EXACT_DUMP_NONCES");
+    }
+
     // 一般模式不依賴 total：持續掃描固定大小的 batch，直到收到 Ctrl-C。
     // 只有 --smoke 才使用 total 作為固定測試量與總吞吐量的分母。
     uint64_t allocation_n = smoke ? total : batch_size;
@@ -481,6 +489,37 @@ int main(int argc, char **argv) {
             CandidateMax(), initial_candidate));
         CUDA_CHECK(cudaMemcpy(&h_best, d_best, sizeof(Candidate),
                               cudaMemcpyDeviceToHost));
+
+        if (exact_epoch_dir != NULL && exact_dump_limit > 0 &&
+            batch_count <= exact_dump_limit) {
+            char path[512];
+            const char *node = getenv("SLURM_NODEID");
+            const char *rank = getenv("SLURM_PROCID");
+            snprintf(path, sizeof(path), "%s/node-%s-rank-%s-batch-%llu.bin",
+                     exact_epoch_dir, node ? node : "0", rank ? rank : "0",
+                     (unsigned long long)batch_index);
+            FILE *fp = fopen(path, "wb");
+            if (!fp) { fprintf(stderr, "無法建立 exact epoch 檔案 %s\n", path); exit(1); }
+            uint64_t *h_hi = (uint64_t *)malloc(batch_count * sizeof(uint64_t));
+            uint64_t *h_lo = (uint64_t *)malloc(batch_count * sizeof(uint64_t));
+            uint64_t *h_nonce = (uint64_t *)malloc(batch_count * sizeof(uint64_t));
+            if (!h_hi || !h_lo || !h_nonce) {
+                fprintf(stderr, "exact epoch host buffer 配置失敗\n"); exit(1);
+            }
+            CUDA_CHECK(cudaMemcpy(h_hi, d_hi, batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_lo, d_lo, batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_nonce, d_nonce, batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+            for (uint64_t i = 0; i < batch_count; ++i) {
+                uint64_t record[3] = {h_hi[i], h_lo[i], h_nonce[i]};
+                if (fwrite(record, sizeof(record), 1, fp) != 1) {
+                    fprintf(stderr, "exact epoch 寫入失敗\n"); exit(1);
+                }
+            }
+            fclose(fp);
+            free(h_hi); free(h_lo); free(h_nonce);
+            printf("exact_epoch_dump=%s records=%llu\n", path,
+                   (unsigned long long)batch_count);
+        }
 
         uint64_t batch_a = h_best.nonce_a, batch_b = h_best.nonce_b;
         int batch_best_bits = h_best.bits;

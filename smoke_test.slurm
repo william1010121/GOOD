@@ -16,6 +16,8 @@ set -euo pipefail
 PREFIX="${PREFIX:-HiPAC2026crypto}"
 SMOKE_NONCES="${SMOKE_NONCES:-100000000}"
 SMOKE_SECONDS="${SMOKE_SECONDS:-60}"
+EXACT_EPOCH="${EXACT_EPOCH:-0}"
+EXACT_EPOCH_NONCES="${EXACT_EPOCH_NONCES:-1000000}"
 
 if ! [[ "${SMOKE_NONCES}" =~ ^[0-9]+$ && "${SMOKE_NONCES}" -gt 0 ]]; then
     echo "SMOKE_NONCES 必須是正整數" >&2
@@ -78,13 +80,18 @@ fi
 WORKDIR="${WORKDIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 RUN_ROOT="${WORKDIR}/.slurm-smoke-${SLURM_JOB_ID}"
 mkdir -p "${RUN_ROOT}"
-export WORKDIR PREFIX SMOKE_NONCES SMOKE_SECONDS RUN_ROOT TASKS
+export WORKDIR PREFIX SMOKE_NONCES SMOKE_SECONDS RUN_ROOT TASKS EXACT_EPOCH EXACT_EPOCH_NONCES
 
 start_epoch="$(date +%s)"
 
 echo "=== ${SMOKE_SECONDS}s multi-node smoke test ==="
 echo "prefix=${PREFIX}, nodes=2, gpus=16, batch/rank=${SMOKE_NONCES}"
 echo "one srun launch; each rank runs continuous mode for ${SMOKE_SECONDS}s"
+if [[ "${EXACT_EPOCH}" == "1" ]]; then
+    rm -rf "${RUN_ROOT}/exact"
+    mkdir -p "${RUN_ROOT}/exact"
+    echo "exact epoch mode: ${EXACT_EPOCH_NONCES} nonce/rank, 56-bit summary + cross-node exact merge"
+fi
 srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
     --kill-on-bad-exit=1 \
     --output="${RUN_ROOT}/rank-%t.out" \
@@ -96,9 +103,15 @@ srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
         cd "${rank_dir}"
         start_nonce="$((SLURM_PROCID * 1000000000000))"
         set +e
-        timeout --signal=INT --kill-after=8s "${SMOKE_SECONDS}s" \
-            env BATCH_NONCES="${SMOKE_NONCES}" "${WORKDIR}/collision" \
-            --start "${start_nonce}" "${PREFIX}"
+        if [[ "${EXACT_EPOCH}" == "1" ]]; then
+            env EXACT_EPOCH_DIR="${RUN_ROOT}/exact" EXACT_DUMP_NONCES="${EXACT_EPOCH_NONCES}" \
+                "${WORKDIR}/collision" --smoke --start "${start_nonce}" \
+                "${PREFIX}" "${EXACT_EPOCH_NONCES}"
+        else
+            timeout --signal=INT --kill-after=8s "${SMOKE_SECONDS}s" \
+                env BATCH_NONCES="${SMOKE_NONCES}" "${WORKDIR}/collision" \
+                --start "${start_nonce}" "${PREFIX}"
+        fi
         rc=$?
         set -e
         if [[ "${rc}" -ne 0 && "${rc}" -ne 124 && "${rc}" -ne 130 ]]; then
@@ -131,6 +144,13 @@ for solution_file in "${solution_files[@]}"; do
         best_file="${solution_file}"
     fi
 done
+
+if [[ "${EXACT_EPOCH}" == "1" ]]; then
+    python3 "${WORKDIR}/exact_epoch_merge.py" \
+        --node0 "${RUN_ROOT}"/exact/node-0-*.bin \
+        --node1 "${RUN_ROOT}"/exact/node-1-*.bin \
+        --output "${WORKDIR}/exact_global.csv"
+fi
 if [[ -n "${best_file}" ]]; then
     cp "${best_file}" "${WORKDIR}/solution_${best_bits}.csv"
 fi

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 
 #define CUDA_CHECK(call) do {                                              \
     cudaError_t _e = (call);                                               \
@@ -147,19 +148,47 @@ __global__ void hash_kernel(const uint32_t *base_words, int nonce_word, int nonc
 }
 
 // ---------------------------------------------------------------------
-// 主機端的排序與比對
-// ---------------------------------------------------------------------
-typedef struct { uint64_t hi, lo, nonce; } Entry;      // 24 bytes
+// GPU radix sort 的資料型別：先對 lo 做 stable sort，再對 hi 做 stable sort。
+// 兩次 stable sort 後，結果就是 (hi, lo) 的 128-bit lexicographic 順序。
+typedef struct { uint64_t other, nonce; } SortValue;
+typedef struct { uint64_t hi, lo, nonce; } SortedEntry;
 
-static int cmp_entry(const void *a, const void *b) {
-    const Entry *x = (const Entry *)a, *y = (const Entry *)b;
-    if (x->hi != y->hi) return (x->hi < y->hi) ? -1 : 1;
-    if (x->lo != y->lo) return (x->lo < y->lo) ? -1 : 1;
-    return 0;
+__global__ void pack_low_values_kernel(const uint64_t *hi, const uint64_t *nonce,
+                                       SortValue *values, uint64_t count) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        values[idx].other = hi[idx];
+        values[idx].nonce = nonce[idx];
+    }
 }
 
+__global__ void pack_high_values_kernel(const uint64_t *lo_sorted,
+                                        const SortValue *low_values,
+                                        uint64_t *hi_keys, SortValue *high_values,
+                                        uint64_t count) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        hi_keys[idx] = low_values[idx].other;
+        high_values[idx].other = lo_sorted[idx];
+        high_values[idx].nonce = low_values[idx].nonce;
+    }
+}
+
+__global__ void pack_sorted_entries_kernel(const uint64_t *hi_sorted,
+                                           const SortValue *high_values,
+                                           SortedEntry *entries, uint64_t count) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        entries[idx].hi = hi_sorted[idx];
+        entries[idx].lo = high_values[idx].other;
+        entries[idx].nonce = high_values[idx].nonce;
+    }
+}
+
+// 主機端的線性比對；排序已在 GPU 完成，不再使用 qsort。
+// ---------------------------------------------------------------------
 // 兩個 128-bit 鍵的共同前綴有幾個 bit
-static int common_prefix_bits(const Entry *a, const Entry *b) {
+static int common_prefix_bits(const SortedEntry *a, const SortedEntry *b) {
     uint64_t x = a->hi ^ b->hi;
     if (x) return __builtin_clzll(x);
     uint64_t y = a->lo ^ b->lo;
@@ -211,7 +240,7 @@ static void write_solution(const char *prefix, uint64_t nonce_a, uint64_t nonce_
     printf("答案已寫入 %s\n", filename);
 }
 
-static int find_best_pair(const Entry *entries, size_t n,
+static int find_best_pair(const SortedEntry *entries, size_t n,
                           uint64_t *best_a, uint64_t *best_b) {
     int best_bits = 0;
     for (size_t i = 0; i + 1 < n; i++) {
@@ -318,28 +347,54 @@ int main(int argc, char **argv) {
     // ★ 優化點：這個範本一次把所有雜湊都存起來，記憶體會成為掃描量的上限，需注意。
     //    每筆 24 bytes，掃 10 億個需要 24 GB。
     size_t n = (size_t)allocation_n;
+    if (n > 0x7fffffffULL) {
+        fprintf(stderr, "CUB radix sort 單批不可超過 2147483647 筆\n");
+        return 2;
+    }
     size_t bytes64 = n * sizeof(uint64_t);
-    printf("需要記憶體：GPU %.2f GB，CPU %.2f GB\n\n",
-           bytes64 * 3 / 1e9, (bytes64 * 3 + n * sizeof(Entry)) / 1e9);
+    size_t bytes_value = n * sizeof(SortValue);
+    size_t bytes_sorted = n * sizeof(SortedEntry);
 
     uint64_t *d_hi, *d_lo, *d_nonce;
+    uint64_t *d_lo_sorted, *d_hi_sort_keys, *d_hi_sorted;
+    SortValue *d_low_in, *d_low_out, *d_high_in, *d_high_out;
+    SortedEntry *d_sorted;
     uint32_t *d_base;
     CUDA_CHECK(cudaMalloc(&d_base,  sizeof(base_words)));
     CUDA_CHECK(cudaMalloc(&d_hi,    bytes64));
     CUDA_CHECK(cudaMalloc(&d_lo,    bytes64));
     CUDA_CHECK(cudaMalloc(&d_nonce, bytes64));
+    CUDA_CHECK(cudaMalloc(&d_lo_sorted,   bytes64));
+    CUDA_CHECK(cudaMalloc(&d_hi_sort_keys, bytes64));
+    CUDA_CHECK(cudaMalloc(&d_hi_sorted,   bytes64));
+    CUDA_CHECK(cudaMalloc(&d_low_in,   bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_low_out,  bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_high_in,  bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_high_out, bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_sorted, bytes_sorted));
     CUDA_CHECK(cudaMemcpy(d_base, base_words, sizeof(base_words), cudaMemcpyHostToDevice));
+
+    size_t temp_bytes_lo = 0, temp_bytes_hi = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_bytes_lo, d_lo, d_lo_sorted, d_low_in, d_low_out,
+        (int)n, 0, 64));
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_bytes_hi, d_hi_sort_keys, d_hi_sorted, d_high_in, d_high_out,
+        (int)n, 0, 64));
+    size_t temp_bytes = (temp_bytes_lo > temp_bytes_hi) ? temp_bytes_lo : temp_bytes_hi;
+    void *d_temp_storage = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_bytes));
+    printf("需要記憶體：GPU %.2f GB（含 CUB temp），CPU %.2f GB\n\n",
+           (bytes64 * 6 + bytes_value * 4 + bytes_sorted + temp_bytes) / 1e9,
+           bytes_sorted / 1e9);
 
     // CUDA event 只量 GPU kernel 本身；CPU 單調時鐘量整體時間。
     cudaEvent_t hash_start, hash_stop;
     CUDA_CHECK(cudaEventCreate(&hash_start));
     CUDA_CHECK(cudaEventCreate(&hash_stop));
 
-    uint64_t *h_hi    = (uint64_t *)malloc(bytes64);
-    uint64_t *h_lo    = (uint64_t *)malloc(bytes64);
-    uint64_t *h_nonce = (uint64_t *)malloc(bytes64);
-    Entry    *entries = (Entry *)malloc(n * sizeof(Entry));
-    if (!h_hi || !h_lo || !h_nonce || !entries) {
+    SortedEntry *h_sorted = (SortedEntry *)malloc(bytes_sorted);
+    if (!h_sorted) {
         fprintf(stderr, "主機記憶體不足\n");
         return 1;
     }
@@ -395,21 +450,32 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
 
-        // ---- 複製回 CPU、排序並找目前批次最佳配對 ----
-        printf("[batch %llu] 複製回主機並排序 …\n",
+        // ---- GPU stable radix sort：先 lo，再 hi；CPU 只收一次排序後結果 ----
+        printf("[batch %llu] GPU radix sort（lo → hi），拷回排序結果 …\n",
                (unsigned long long)batch_index);
-        CUDA_CHECK(cudaMemcpy(h_hi,    d_hi,    batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_lo,    d_lo,    batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_nonce, d_nonce, batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < (size_t)batch_count; i++) {
-            entries[i].hi = h_hi[i];
-            entries[i].lo = h_lo[i];
-            entries[i].nonce = h_nonce[i];
-        }
-        qsort(entries, (size_t)batch_count, sizeof(Entry), cmp_entry);
+        int sort_count = (int)batch_count;
+        int sort_blocks = (sort_count + threads - 1) / threads;
+        pack_low_values_kernel<<<sort_blocks, threads>>>(d_hi, d_nonce, d_low_in,
+                                                          batch_count);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+            d_temp_storage, temp_bytes_lo, d_lo, d_lo_sorted, d_low_in, d_low_out,
+            sort_count, 0, 64));
+        pack_high_values_kernel<<<sort_blocks, threads>>>(d_lo_sorted, d_low_out,
+                                                           d_hi_sort_keys, d_high_in,
+                                                           batch_count);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+            d_temp_storage, temp_bytes_hi, d_hi_sort_keys, d_hi_sorted,
+            d_high_in, d_high_out, sort_count, 0, 64));
+        pack_sorted_entries_kernel<<<sort_blocks, threads>>>(d_hi_sorted, d_high_out,
+                                                              d_sorted, batch_count);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(h_sorted, d_sorted, batch_count * sizeof(SortedEntry),
+                              cudaMemcpyDeviceToHost));
 
         uint64_t batch_a = 0, batch_b = 0;
-        int batch_best_bits = find_best_pair(entries, (size_t)batch_count,
+        int batch_best_bits = find_best_pair(h_sorted, (size_t)batch_count,
                                              &batch_a, &batch_b);
         if (batch_best_bits > best_bits) {
             best_bits = batch_best_bits;
@@ -460,7 +526,12 @@ int main(int argc, char **argv) {
                prefix, (unsigned long long)best_a, (unsigned long long)best_b);
     }
 
-    free(entries); free(h_hi); free(h_lo); free(h_nonce);
+    free(h_sorted);
+    cudaFree(d_temp_storage);
+    cudaFree(d_sorted);
+    cudaFree(d_high_out); cudaFree(d_high_in);
+    cudaFree(d_low_out); cudaFree(d_low_in);
+    cudaFree(d_hi_sorted); cudaFree(d_hi_sort_keys); cudaFree(d_lo_sorted);
     cudaFree(d_base); cudaFree(d_hi); cudaFree(d_lo); cudaFree(d_nonce);
     cudaEventDestroy(hash_start);
     cudaEventDestroy(hash_stop);

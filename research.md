@@ -9,8 +9,10 @@
 | `1b0b1d8` | 加入 continuous 模式、`--smoke`、`--start`、2 nodes × 8 GPUs 與 qbit 進度回報。 | Job `485`：16 GPU，2.24B nonce / 66 秒，aggregate **33.94 MH/s**，平均每 GPU **2.12 MH/s**。 | **55 qbit** |
 | `2cd1427` | 新增 `research.md`，記錄前一輪 smoke 結果。 | 沿用 Job `480`：**3.55 MH/s**，220M nonce / 62 秒。沒有新增測試。 | **51 qbit** |
 | `9750d50` | 將 CPU `qsort` 改成 CUB GPU stable radix sort，排序後只拷回一次結果。 | Job `491`：16 GPU，4.48B nonce / 63 秒，aggregate **71.11 MH/s**，平均每 GPU **4.44 MH/s**。 | **55 qbit** |
-| `701169f` | 將最佳 pair reduction 放到 GPU，並修正 smoke run 的 nonce range offset。 | Job `501` 在取得資源前被取消，沒有有效 smoke 結果。 | 未記錄 |
-| `a7403d7` | 更新 100M batch 與 GPU reduction 的使用說明。 | 沒有新增 smoke。 | 沿用前一版本 |
+| `701169f` | 將最佳 pair reduction 放到 GPU，修正 nonce range offset，並把 continuous batch 預設提高到 100M。 | Job `503`：16 GPU，19.2B nonce / 65 秒，彙總 **295.38 MH/s**；單 batch raw throughput 平均 **2,226.70 MH/s**。 | **56 qbit** |
+| `a7403d7` | 更新 100M batch 與 GPU reduction 的使用說明。 | 沿用 Job `503` 的程式結果；沒有另外新增測試。 | **56 qbit** |
+| `c0fc777` | 保存 Job `496` 找到並驗證的 `solution_64.csv`。 | 沒有新增 smoke。 | **64 qbit** |
+| `85cdaa7` | 記錄正式 goal 結果與跨 rank exact merge 限制。 | 沒有新增 smoke。 | **64 qbit** |
 
 ## 已完成 smoke 詳情
 
@@ -80,3 +82,17 @@ rank B: B1 ↔ B2 ↔ B3
 程式會找出 A 內與 B 內的最佳 pair，但沒有比較 `A1 ↔ B1`。因此目前的 qbit 是「所有 rank local best 中的最大值」，不是所有 nonce 合併後的 exact global best。
 
 要做到 exact merge，必須把各 rank 的排序 hash/candidate 依 prefix 分區後交換，再在共同排序結果上比較；只收集每個 rank 的一組 `solution_*.csv` 不足以保證找出跨 rank 的最佳 pair。
+
+### Job 503 — 100M batch + GPU pair reduction
+
+- Nodes: `team2server[1-2]`
+- GPU tasks: 16（2 nodes × 8 GPUs）
+- Prefix: `HiPAC2026crypto`
+- Workload: 12 runs × 16 ranks × 100,000,000 nonce = 19,200,000,000 nonce
+- Wall time: 65 seconds
+- Scheduler-level aggregate throughput: **295.38 MH/s**
+- Per-rank completed-batch throughput: average **2,226.70 MH/s**, range **2,062.67–2,336.77 MH/s**
+- Best result: **56-bit common prefix**
+- Verification: passed with `verify_collision.py`
+
+The 295.38 MH/s figure includes repeated `srun` launch overhead from the smoke harness. The per-batch figure is the more useful algorithm-path measurement. Compared with Job `491` (20M batch, CPU candidate scan, 61.94 MH/s per completed batch), Job `503` is approximately **35.9×** faster on the completed batch path; the scheduler-level aggregate is approximately **4.15×** higher than Job `491` because 100M batches also amortize launch overhead.

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <signal.h>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(call) do {                                              \
@@ -177,6 +178,13 @@ static double throughput_mhps(uint64_t count, double seconds) {
     return (seconds > 0.0) ? ((double)count / seconds / 1e6) : 0.0;
 }
 
+static volatile sig_atomic_t stop_requested = 0;
+
+static void request_stop(int signal_number) {
+    (void)signal_number;
+    stop_requested = 1;
+}
+
 // =====================================================================
 // ★★★ 輸出檔案格式 —— 請勿修改 ★★★
 //
@@ -203,14 +211,88 @@ static void write_solution(const char *prefix, uint64_t nonce_a, uint64_t nonce_
     printf("答案已寫入 %s\n", filename);
 }
 
+static int find_best_pair(const Entry *entries, size_t n,
+                          uint64_t *best_a, uint64_t *best_b) {
+    int best_bits = 0;
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (entries[i].nonce == entries[i+1].nonce) continue;
+        int bits = common_prefix_bits(&entries[i], &entries[i+1]);
+        if (bits > best_bits) {
+            best_bits = bits;
+            *best_a = entries[i].nonce;
+            *best_b = entries[i+1].nonce;
+        }
+    }
+    return best_bits;
+}
+
+static uint64_t parse_u64_value(const char *text, const char *name, int allow_zero) {
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (text[0] == '\0' || *end != '\0' || (!allow_zero && value == 0)) {
+        fprintf(stderr, "%s 必須是正整數：%s\n", name, text);
+        exit(2);
+    }
+    return (uint64_t)value;
+}
+
+static uint64_t parse_positive_u64(const char *text, const char *name) {
+    return parse_u64_value(text, name, 0);
+}
+
+static void print_usage(const char *program) {
+    fprintf(stderr,
+            "用法：\n"
+            "  %s [--start N] [prefix]              一般模式：持續以 batch 掃描\n"
+            "  %s --smoke [--start N] [prefix] [total]  smoke 模式：掃固定 total 後結束\n"
+            "環境變數：BATCH_NONCES（一般模式每批數量，預設 20000000）\n",
+            program, program);
+}
+
 // =====================================================================
 int main(int argc, char **argv) {
-    const char *prefix = (argc > 1) ? argv[1] : "hipac_demo";
-    uint64_t total = (argc > 2) ? strtoull(argv[2], NULL, 10) : 20000000ULL;
+    int smoke = 0;
+    uint64_t nonce_start = 0;
+    int argi = 1;
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strcmp(argv[argi], "--smoke") == 0) {
+            smoke = 1;
+            argi++;
+        } else if (strcmp(argv[argi], "--start") == 0 && argi + 1 < argc) {
+            nonce_start = parse_u64_value(argv[argi + 1], "start", 1);
+            argi += 2;
+        } else {
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
 
-    // nonce 是 64-bit，搜尋空間實質上無上限；真正的限制是記憶體與時間。
-    if (total > 4000000000ULL) {
-        fprintf(stderr, "單趟 %llu 筆需要 %.1f GB，請確認記憶體是否足夠\n",
+    const char *prefix = (argi < argc) ? argv[argi++] : "hipac_demo";
+    uint64_t total = 0;
+    if (smoke) {
+        total = (argi < argc) ? parse_positive_u64(argv[argi++], "total") : 20000000ULL;
+    }
+    if (argi != argc) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
+    const uint64_t default_batch = 20000000ULL;
+    uint64_t batch_size = default_batch;
+    const char *batch_text = getenv("BATCH_NONCES");
+    if (!smoke && batch_text != NULL) {
+        batch_size = parse_positive_u64(batch_text, "BATCH_NONCES");
+    }
+    if (batch_size > 0xffffffffULL || (smoke && total > 0xffffffffULL)) {
+        fprintf(stderr, "單批數量不可超過 4294967295\n");
+        return 2;
+    }
+
+    // 一般模式不依賴 total：持續掃描固定大小的 batch，直到收到 Ctrl-C。
+    // 只有 --smoke 才使用 total 作為固定測試量與總吞吐量的分母。
+    uint64_t allocation_n = smoke ? total : batch_size;
+    if (smoke && total > 4000000000ULL) {
+        fprintf(stderr, "smoke 單趟 %llu 筆需要 %.1f GB，請確認記憶體是否足夠\n",
                 (unsigned long long)total, total * 24.0 / 1e9);
     }
 
@@ -223,12 +305,19 @@ int main(int argc, char **argv) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("使用 GPU: %s（%d 個 SM）\n", prop.name, prop.multiProcessorCount);
-    printf("prefix = \"%s\"    掃描 %llu 個 nonce\n\n",
-           prefix, (unsigned long long)total);
+    if (smoke) {
+        printf("模式 = smoke，prefix = \"%s\"    掃描 %llu 個 nonce\n\n",
+               prefix, (unsigned long long)total);
+    } else {
+        printf("模式 = continuous，prefix = \"%s\"    每批掃描 %llu 個 nonce\n\n",
+               prefix, (unsigned long long)batch_size);
+        signal(SIGINT, request_stop);
+        signal(SIGTERM, request_stop);
+    }
 
     // ★ 優化點：這個範本一次把所有雜湊都存起來，記憶體會成為掃描量的上限，需注意。
     //    每筆 24 bytes，掃 10 億個需要 24 GB。
-    size_t n = (size_t)total;
+    size_t n = (size_t)allocation_n;
     size_t bytes64 = n * sizeof(uint64_t);
     printf("需要記憶體：GPU %.2f GB，CPU %.2f GB\n\n",
            bytes64 * 3 / 1e9, (bytes64 * 3 + n * sizeof(Entry)) / 1e9);
@@ -245,94 +334,135 @@ int main(int argc, char **argv) {
     cudaEvent_t hash_start, hash_stop;
     CUDA_CHECK(cudaEventCreate(&hash_start));
     CUDA_CHECK(cudaEventCreate(&hash_stop));
-    double total_start = monotonic_seconds();
 
-    // ---- 第 1 步：GPU 平行計算所有雜湊 ----
-    int threads = 256;
-    const uint64_t report_every = 10000000ULL;
-    double hash_seconds = 0.0;
-    uint64_t done = 0;
-    printf("[1/3] GPU 計算 %llu 個雜湊 …\n", (unsigned long long)total);
-    while (done < total) {
-        uint32_t count = (uint32_t)(((total - done) > report_every) ?
-                                    report_every : (total - done));
-        int blocks = (count + threads - 1) / threads;
-
-        CUDA_CHECK(cudaEventRecord(hash_start));
-        hash_kernel<<<blocks, threads>>>(d_base, nonce_word, nonce_shift,
-                                         done, count,
-                                         d_hi + done, d_lo + done,
-                                         d_nonce + done);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaEventRecord(hash_stop));
-        CUDA_CHECK(cudaEventSynchronize(hash_stop));
-
-        float batch_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&batch_ms, hash_start, hash_stop));
-        hash_seconds += (double)batch_ms / 1000.0;
-        done += count;
-
-        printf("[進度] %llu/%llu (%.1f%%)，吞吐量 %.2f MH/s\n",
-               (unsigned long long)done, (unsigned long long)total,
-               100.0 * (double)done / (double)total,
-               throughput_mhps(done, monotonic_seconds() - total_start));
-        fflush(stdout);
-    }
-
-    // ---- 第 2 步：複製回 CPU 並排序 ----
-    //   ★ 優化點（最重要）：這一步是瓶頸，整段期間 GPU 閒置。
-    printf("[2/3] 複製回主機並排序 …\n");
     uint64_t *h_hi    = (uint64_t *)malloc(bytes64);
     uint64_t *h_lo    = (uint64_t *)malloc(bytes64);
     uint64_t *h_nonce = (uint64_t *)malloc(bytes64);
     Entry    *entries = (Entry *)malloc(n * sizeof(Entry));
     if (!h_hi || !h_lo || !h_nonce || !entries) {
-        fprintf(stderr, "主機記憶體不足\n"); exit(1);
+        fprintf(stderr, "主機記憶體不足\n");
+        return 1;
     }
-    CUDA_CHECK(cudaMemcpy(h_hi,    d_hi,    bytes64, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_lo,    d_lo,    bytes64, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_nonce, d_nonce, bytes64, cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < n; i++) {
-        entries[i].hi = h_hi[i];
-        entries[i].lo = h_lo[i];
-        entries[i].nonce = h_nonce[i];
-    }
-    qsort(entries, n, sizeof(Entry), cmp_entry);
 
-    // ---- 第 3 步：掃描相鄰配對 ----
-    //   排序後，最佳解一定是某一組相鄰對，所以只需掃一次。
-    printf("[3/3] 掃描相鄰配對 …\n\n");
+    const int threads = 256;
+    const uint64_t report_every = 10000000ULL;
+    const double run_start = monotonic_seconds();
+    uint64_t scanned = 0;
+    uint64_t next_nonce = nonce_start;
+    uint64_t batch_index = 0;
     int best_bits = 0;
     uint64_t best_a = 0, best_b = 0;
-    for (size_t i = 0; i + 1 < n; i++) {
-        if (entries[i].nonce == entries[i+1].nonce) continue;   // 必須是不同 nonce
-        int bits = common_prefix_bits(&entries[i], &entries[i+1]);
-        if (bits > best_bits) {
-            best_bits = bits;
-            best_a = entries[i].nonce;
-            best_b = entries[i+1].nonce;
+    int have_solution = 0;
+
+    while (!stop_requested && (smoke ? scanned < total : 1)) {
+        uint64_t batch_count = smoke ? total : batch_size;
+        double batch_start = monotonic_seconds();
+        double hash_seconds = 0.0;
+        uint64_t done = 0;
+        uint64_t batch_start_nonce = next_nonce;
+        batch_index++;
+
+        printf("[batch %llu] GPU 計算 %llu 個雜湊 …\n",
+               (unsigned long long)batch_index,
+               (unsigned long long)batch_count);
+        while (done < batch_count) {
+            uint32_t count = (uint32_t)(((batch_count - done) > report_every) ?
+                                        report_every : (batch_count - done));
+            int blocks = (count + threads - 1) / threads;
+
+            CUDA_CHECK(cudaEventRecord(hash_start));
+            hash_kernel<<<blocks, threads>>>(d_base, nonce_word, nonce_shift,
+                                             batch_start_nonce + done, count,
+                                             d_hi + done, d_lo + done,
+                                             d_nonce + done);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(hash_stop));
+            CUDA_CHECK(cudaEventSynchronize(hash_stop));
+
+            float batch_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&batch_ms, hash_start, hash_stop));
+            hash_seconds += (double)batch_ms / 1000.0;
+            done += count;
+
+            if (smoke) {
+                printf("[進度] %llu/%llu (%.1f%%)\n",
+                       (unsigned long long)done, (unsigned long long)batch_count,
+                       100.0 * (double)done / (double)batch_count);
+            } else {
+                printf("[進度] 本批 %llu/%llu\n",
+                       (unsigned long long)done, (unsigned long long)batch_count);
+            }
+            fflush(stdout);
         }
+
+        // ---- 複製回 CPU、排序並找目前批次最佳配對 ----
+        printf("[batch %llu] 複製回主機並排序 …\n",
+               (unsigned long long)batch_index);
+        CUDA_CHECK(cudaMemcpy(h_hi,    d_hi,    batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_lo,    d_lo,    batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_nonce, d_nonce, batch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < (size_t)batch_count; i++) {
+            entries[i].hi = h_hi[i];
+            entries[i].lo = h_lo[i];
+            entries[i].nonce = h_nonce[i];
+        }
+        qsort(entries, (size_t)batch_count, sizeof(Entry), cmp_entry);
+
+        uint64_t batch_a = 0, batch_b = 0;
+        int batch_best_bits = find_best_pair(entries, (size_t)batch_count,
+                                             &batch_a, &batch_b);
+        if (batch_best_bits > best_bits) {
+            best_bits = batch_best_bits;
+            best_a = batch_a;
+            best_b = batch_b;
+            have_solution = 1;
+            write_solution(prefix, best_a, best_b, best_bits);
+        }
+
+        scanned += batch_count;
+        next_nonce += batch_count;
+        double batch_seconds = monotonic_seconds() - batch_start;
+        double elapsed_seconds = monotonic_seconds() - run_start;
+        printf("目前最多共同前綴 qbit：%d（本批 %d）\n",
+               best_bits, batch_best_bits);
+        if (smoke) {
+            printf("耗時    : %.3f 秒\n", batch_seconds);
+            printf("吞吐量  : GPU hash %.2f MH/s，整體 %.2f MH/s\n",
+                   throughput_mhps(batch_count, hash_seconds),
+                   throughput_mhps(batch_count, batch_seconds));
+        } else {
+            printf("[batch %llu] 耗時 %.3f 秒，GPU hash %.2f MH/s，整體 %.2f MH/s，累計 %.2f MH/s\n",
+                   (unsigned long long)batch_index, batch_seconds,
+                   throughput_mhps(batch_count, hash_seconds),
+                   throughput_mhps(batch_count, batch_seconds),
+                   throughput_mhps(scanned, elapsed_seconds));
+        }
+        fflush(stdout);
+
+        if (smoke) break;
     }
 
-    double total_seconds = monotonic_seconds() - total_start;
-    printf("----------------------------------------\n");
-    printf("最佳結果：共同前綴 %d bits\n", best_bits);
-    printf("nonce_a : %llu\n", (unsigned long long)best_a);
-    printf("nonce_b : %llu\n", (unsigned long long)best_b);
-    printf("耗時    : %.3f 秒\n", total_seconds);
-    printf("吞吐量  : GPU hash %.2f MH/s，整體 %.2f MH/s\n",
-           throughput_mhps(total, hash_seconds),
-           throughput_mhps(total, total_seconds));
+    if (!smoke && stop_requested) {
+        printf("收到停止訊號，已完成 %llu 個 nonce。\n",
+               (unsigned long long)scanned);
+    }
+    if (!have_solution) {
+        fprintf(stderr, "沒有找到合法的不同 nonce 配對\n");
+    }
 
-    write_solution(prefix, best_a, best_b, best_bits);
-
-    printf("\n驗證指令：\n");
-    printf("  python3 verify_collision.py -p %s -a %llu -b %llu\n",
-           prefix, (unsigned long long)best_a, (unsigned long long)best_b);
+    /*
+     * 一般模式在每個 batch 完成時已寫入當下最佳解；smoke 模式也同樣
+     * 寫入，因此這裡只保留驗證提示，不再用 total 重算吞吐量。
+     */
+    if (have_solution) {
+        printf("\n驗證指令：\n");
+        printf("  python3 verify_collision.py -p %s -a %llu -b %llu\n",
+               prefix, (unsigned long long)best_a, (unsigned long long)best_b);
+    }
 
     free(entries); free(h_hi); free(h_lo); free(h_nonce);
     cudaFree(d_base); cudaFree(d_hi); cudaFree(d_lo); cudaFree(d_nonce);
     cudaEventDestroy(hash_start);
     cudaEventDestroy(hash_stop);
-    return 0;
+    return have_solution ? 0 : 1;
 }

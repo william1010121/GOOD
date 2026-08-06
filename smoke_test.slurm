@@ -1,16 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=hipac-smoke
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --nodes=2
+#SBATCH --ntasks=16
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=1
 #SBATCH --time=00:05:00
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 
 set -euo pipefail
 
-# 可用 sbatch --export=ALL,PREFIX=hipac_demo,SMOKE_NONCES=20000000,
+# 可用 sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,
 #   SMOKE_SECONDS=60 smoke_test.slurm 覆寫。
-PREFIX="${PREFIX:-hipac_demo}"
+PREFIX="${PREFIX:-HiPAC2026crypto}"
 SMOKE_NONCES="${SMOKE_NONCES:-20000000}"
 SMOKE_SECONDS="${SMOKE_SECONDS:-60}"
 
@@ -66,31 +69,78 @@ else
     make -B
 fi
 
+TASKS="${SLURM_NTASKS:-16}"
+if [[ "${TASKS}" -ne 16 ]]; then
+    echo "需要 16 個 task（2 nodes x 8 GPUs），目前是 ${TASKS}" >&2
+    exit 2
+fi
+
+WORKDIR="${WORKDIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
+RUN_ROOT="${WORKDIR}/.slurm-smoke-${SLURM_JOB_ID}"
+mkdir -p "${RUN_ROOT}"
+export WORKDIR PREFIX SMOKE_NONCES RUN_ROOT
+
 start_epoch="$(date +%s)"
 deadline=$((start_epoch + SMOKE_SECONDS))
 runs=0
 total_nonces=0
 
-echo "=== ${SMOKE_SECONDS}s smoke test ==="
-echo "prefix=${PREFIX}, nonces/run=${SMOKE_NONCES}"
+echo "=== ${SMOKE_SECONDS}s multi-node smoke test ==="
+echo "prefix=${PREFIX}, nodes=2, gpus=16, nonces/rank=${SMOKE_NONCES}"
 while true; do
     now="$(date +%s)"
     if (( runs > 0 && now >= deadline )); then
         break
     fi
 
-    ./collision "${PREFIX}" "${SMOKE_NONCES}"
+    run_index="${runs}"
+    mkdir -p "${RUN_ROOT}/run-${run_index}"
+    export RUN_INDEX="${run_index}"
+    srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
+        --kill-on-bad-exit=1 \
+        --output="${RUN_ROOT}/run-${run_index}/rank-%t.out" \
+        --error="${RUN_ROOT}/run-${run_index}/rank-%t.err" \
+        bash -c '
+            set -euo pipefail
+            rank_dir="${RUN_ROOT}/run-${RUN_INDEX}/rank-${SLURM_PROCID}"
+            mkdir -p "${rank_dir}"
+            cd "${rank_dir}"
+            exec "${WORKDIR}/collision" --smoke --start "$((SLURM_PROCID * SMOKE_NONCES))" "${PREFIX}" "${SMOKE_NONCES}"
+        '
     runs=$((runs + 1))
-    total_nonces=$((total_nonces + SMOKE_NONCES))
+    total_nonces=$((total_nonces + TASKS * SMOKE_NONCES))
 done
 
 end_epoch="$(date +%s)"
 elapsed=$((end_epoch - start_epoch))
 (( elapsed > 0 )) || elapsed=1
 
+shopt -s nullglob
+log_files=("${RUN_ROOT}"/run-*/rank-*.out)
+solution_files=("${RUN_ROOT}"/run-*/rank-*/solution_*.csv)
+max_qbit=0
+if (( ${#log_files[@]} > 0 )); then
+    max_qbit="$(awk '/目前最多共同前綴 qbit：/ { split($0, p, "："); split(p[2], q, "（"); v=q[1]+0; if (v > max) max=v } END { print max+0 }' "${log_files[@]}")"
+fi
+
+best_bits=0
+best_file=""
+for solution_file in "${solution_files[@]}"; do
+    bits="${solution_file##*solution_}"
+    bits="${bits%.csv}"
+    if (( bits > best_bits )); then
+        best_bits="${bits}"
+        best_file="${solution_file}"
+    fi
+done
+if [[ -n "${best_file}" ]]; then
+    cp "${best_file}" "${WORKDIR}/solution_${best_bits}.csv"
+fi
+
 echo "=== smoke summary ==="
 echo "completed_runs=${runs}"
 echo "completed_nonces=${total_nonces}"
 echo "elapsed_seconds=${elapsed}"
-awk -v n="${total_nonces}" -v s="${elapsed}" \
-    'BEGIN { printf "aggregate_throughput=%.2f MH/s (completed nonce / wall time)\n", n / s / 1000000 }'
+echo "current_max_qbit_prefix=${max_qbit}"
+awk -v n="${total_nonces}" -v s="${elapsed}" -v g="${TASKS}" \
+    'BEGIN { printf "aggregate_throughput=%.2f MH/s (16 GPUs, completed nonce / wall time)\nper_gpu_throughput=%.2f MH/s\n", n / s / 1000000, n / s / 1000000 / g }'

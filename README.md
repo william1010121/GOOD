@@ -79,23 +79,24 @@ nvcc -O3 -Xcompiler -fopenmp -arch=sm_90 collision.cu -o collision
 
 ## 如何執行
 
+一般模式不使用 `total`，會持續以固定 batch 掃描，直到收到 `Ctrl-C`；每批完成後會回報目前找到的最高共同前綴 qbit 數量。每批大小可用 `BATCH_NONCES` 調整：
+
 ```bash
-./collision <prefix> <掃描的 nonce 數量>
+BATCH_NONCES=20000000 ./collision HiPAC2026crypto
 ```
 
-範例：
+只有明確加上 `--smoke` 才使用固定的 `total`，並在完成後結束：
 
 ```bash
-./collision hipac_demo 20000000      # 掃 2000 萬個 nonce
-./collision hipac_demo 500000000     # 掃 5 億個
+./collision --smoke HiPAC2026crypto 20000000
 ```
 
 ### Slurm 1 分鐘 smoke test
 
-`smoke_test.slurm` 會先編譯，再重複完成固定大小的掃描批次，直到達到 60 秒，最後輸出整體彙總吞吐量：
+`smoke_test.slurm` 會先編譯，再以 2 個 node、每個 node 8 張 GPU（共 16 張）執行 `--smoke`，重複完成固定大小的掃描批次直到達到 60 秒，最後輸出整體彙總吞吐量與目前最高 qbit 前綴：
 
 ```bash
-sbatch --export=ALL,PREFIX=hipac_demo,SMOKE_NONCES=20000000,SMOKE_SECONDS=60 smoke_test.slurm
+sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,SMOKE_SECONDS=60 smoke_test.slurm
 ```
 
 若叢集沒有自動找到 CUDA，可設定 `CUDA_MODULE`；若要指定 GPU 架構，可設定 `ARCH=sm_90`。工作目錄預設使用 `SLURM_SUBMIT_DIR`，也可用 `WORKDIR` 覆寫。

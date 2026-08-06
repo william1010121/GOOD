@@ -148,8 +148,8 @@ __global__ void hash_kernel(const uint32_t *base_words, int nonce_word, int nonc
 }
 
 // ---------------------------------------------------------------------
-// GPU radix sort 的資料型別：先對 lo 做 stable sort，再對 hi 做 stable sort。
-// 兩次 stable sort 後，結果就是 (hi, lo) 的 128-bit lexicographic 順序。
+// GPU radix sort 的資料型別：只按前 64 bits 排序，value 保留後 64 bits 與 nonce。
+// 排序後相鄰值可直接比較完整的 128-bit hash；同一前綴群組內以 low bits 比較。
 typedef struct { uint64_t other, nonce; } SortValue;
 typedef struct { int bits, valid; uint64_t nonce_a, nonce_b; } Candidate;
 
@@ -162,24 +162,12 @@ struct CandidateMax {
     }
 };
 
-__global__ void pack_low_values_kernel(const uint64_t *hi, const uint64_t *nonce,
-                                       SortValue *values, uint64_t count) {
+__global__ void pack_sort_values_kernel(const uint64_t *lo, const uint64_t *nonce,
+                                        SortValue *values, uint64_t count) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
-        values[idx].other = hi[idx];
+        values[idx].other = lo[idx];
         values[idx].nonce = nonce[idx];
-    }
-}
-
-__global__ void pack_high_values_kernel(const uint64_t *lo_sorted,
-                                        const SortValue *low_values,
-                                        uint64_t *hi_keys, SortValue *high_values,
-                                        uint64_t count) {
-    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        hi_keys[idx] = low_values[idx].other;
-        high_values[idx].other = lo_sorted[idx];
-        high_values[idx].nonce = low_values[idx].nonce;
     }
 }
 
@@ -198,13 +186,30 @@ __global__ void best_pair_kernel(const uint64_t *hi_sorted,
     extern __shared__ Candidate shared[];
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     Candidate best = {0, 0, 0, 0};
-    if (idx + 1 < count && high_values[idx].nonce != high_values[idx + 1].nonce) {
-        best.bits = common_prefix_bits_raw(
-            hi_sorted[idx], high_values[idx].other,
-            hi_sorted[idx + 1], high_values[idx + 1].other);
-        best.valid = 1;
-        best.nonce_a = high_values[idx].nonce;
-        best.nonce_b = high_values[idx + 1].nonce;
+    if (idx + 1 < count) {
+        // 不排序 low bits：對相同 high-64 群組直接掃描群組內所有 pair，
+        // 對不同 high-64 的相鄰項目只需比較這一對。隨機 hash 下群組通常只有 1 筆。
+        uint64_t j = idx + 1;
+        if (hi_sorted[j] == hi_sorted[idx]) {
+            while (j < count && hi_sorted[j] == hi_sorted[idx]) {
+                if (high_values[idx].nonce != high_values[j].nonce) {
+                    int bits = common_prefix_bits_raw(
+                        hi_sorted[idx], high_values[idx].other,
+                        hi_sorted[j], high_values[j].other);
+                    Candidate candidate = {bits, 1, high_values[idx].nonce,
+                                           high_values[j].nonce};
+                    best = CandidateMax()(best, candidate);
+                }
+                ++j;
+            }
+        } else if (high_values[idx].nonce != high_values[j].nonce) {
+            best.bits = common_prefix_bits_raw(
+                hi_sorted[idx], high_values[idx].other,
+                hi_sorted[j], high_values[j].other);
+            best.valid = 1;
+            best.nonce_a = high_values[idx].nonce;
+            best.nonce_b = high_values[j].nonce;
+        }
     }
     shared[threadIdx.x] = best;
     __syncthreads();
@@ -368,44 +373,36 @@ int main(int argc, char **argv) {
     size_t bytes_block_candidates = (size_t)pair_blocks * sizeof(Candidate);
 
     uint64_t *d_hi, *d_lo, *d_nonce;
-    uint64_t *d_lo_sorted, *d_hi_sort_keys, *d_hi_sorted;
-    SortValue *d_low_in, *d_low_out, *d_high_in, *d_high_out;
+    uint64_t *d_hi_sorted;
+    SortValue *d_sort_in, *d_sort_out;
     Candidate *d_block_best, *d_best;
     uint32_t *d_base;
     CUDA_CHECK(cudaMalloc(&d_base,  sizeof(base_words)));
     CUDA_CHECK(cudaMalloc(&d_hi,    bytes64));
     CUDA_CHECK(cudaMalloc(&d_lo,    bytes64));
     CUDA_CHECK(cudaMalloc(&d_nonce, bytes64));
-    CUDA_CHECK(cudaMalloc(&d_lo_sorted,   bytes64));
-    CUDA_CHECK(cudaMalloc(&d_hi_sort_keys, bytes64));
     CUDA_CHECK(cudaMalloc(&d_hi_sorted,   bytes64));
-    CUDA_CHECK(cudaMalloc(&d_low_in,   bytes_value));
-    CUDA_CHECK(cudaMalloc(&d_low_out,  bytes_value));
-    CUDA_CHECK(cudaMalloc(&d_high_in,  bytes_value));
-    CUDA_CHECK(cudaMalloc(&d_high_out, bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_sort_in,   bytes_value));
+    CUDA_CHECK(cudaMalloc(&d_sort_out,  bytes_value));
     CUDA_CHECK(cudaMalloc(&d_block_best, bytes_block_candidates));
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(Candidate)));
     CUDA_CHECK(cudaMemcpy(d_base, base_words, sizeof(base_words), cudaMemcpyHostToDevice));
 
-    size_t temp_bytes_lo = 0, temp_bytes_hi = 0;
+    size_t temp_bytes_sort = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_bytes_lo, d_lo, d_lo_sorted, d_low_in, d_low_out,
-        (int)n, 0, 64));
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_bytes_hi, d_hi_sort_keys, d_hi_sorted, d_high_in, d_high_out,
+        nullptr, temp_bytes_sort, d_hi, d_hi_sorted, d_sort_in, d_sort_out,
         (int)n, 0, 64));
     size_t temp_bytes_reduce = 0;
     Candidate initial_candidate = {0, 0, 0, 0};
     CUDA_CHECK(cub::DeviceReduce::Reduce(
         nullptr, temp_bytes_reduce, d_block_best, d_best, pair_blocks,
         CandidateMax(), initial_candidate));
-    size_t temp_bytes_sort = (temp_bytes_lo > temp_bytes_hi) ? temp_bytes_lo : temp_bytes_hi;
     size_t temp_bytes = (temp_bytes_sort > temp_bytes_reduce) ?
                         temp_bytes_sort : temp_bytes_reduce;
     void *d_temp_storage = nullptr;
     CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_bytes));
     printf("需要記憶體：GPU %.2f GB（含 CUB sort/reduce temp），CPU %.2f MB\n\n",
-           (bytes64 * 6 + bytes_value * 4 +
+           (bytes64 * 4 + bytes_value * 2 +
             bytes_block_candidates + sizeof(Candidate) + temp_bytes) / 1e9,
            sizeof(Candidate) / 1e6);
 
@@ -465,26 +462,19 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
 
-        // ---- GPU stable radix sort + GPU adjacent-pair reduction ----
-        printf("[batch %llu] GPU radix sort（lo → hi）+ pair reduction …\n",
+        // ---- GPU single 64-bit radix sort + GPU full-key adjacent-pair reduction ----
+        printf("[batch %llu] GPU radix sort（64-bit prefix）+ pair reduction …\n",
                (unsigned long long)batch_index);
         int sort_count = (int)batch_count;
         int sort_blocks = (sort_count + threads - 1) / threads;
-        pack_low_values_kernel<<<sort_blocks, threads>>>(d_hi, d_nonce, d_low_in,
+        pack_sort_values_kernel<<<sort_blocks, threads>>>(d_lo, d_nonce, d_sort_in,
                                                           batch_count);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-            d_temp_storage, temp_bytes_lo, d_lo, d_lo_sorted, d_low_in, d_low_out,
+            d_temp_storage, temp_bytes_sort, d_hi, d_hi_sorted, d_sort_in, d_sort_out,
             sort_count, 0, 64));
-        pack_high_values_kernel<<<sort_blocks, threads>>>(d_lo_sorted, d_low_out,
-                                                           d_hi_sort_keys, d_high_in,
-                                                           batch_count);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-            d_temp_storage, temp_bytes_hi, d_hi_sort_keys, d_hi_sorted,
-            d_high_in, d_high_out, sort_count, 0, 64));
         best_pair_kernel<<<pair_blocks, threads, threads * sizeof(Candidate)>>>(
-            d_hi_sorted, d_high_out, batch_count, d_block_best);
+            d_hi_sorted, d_sort_out, batch_count, d_block_best);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cub::DeviceReduce::Reduce(
             d_temp_storage, temp_bytes_reduce, d_block_best, d_best, pair_blocks,
@@ -545,9 +535,8 @@ int main(int argc, char **argv) {
 
     cudaFree(d_temp_storage);
     cudaFree(d_best); cudaFree(d_block_best);
-    cudaFree(d_high_out); cudaFree(d_high_in);
-    cudaFree(d_low_out); cudaFree(d_low_in);
-    cudaFree(d_hi_sorted); cudaFree(d_hi_sort_keys); cudaFree(d_lo_sorted);
+    cudaFree(d_sort_out); cudaFree(d_sort_in);
+    cudaFree(d_hi_sorted);
     cudaFree(d_base); cudaFree(d_hi); cudaFree(d_lo); cudaFree(d_nonce);
     cudaEventDestroy(hash_start);
     cudaEventDestroy(hash_stop);

@@ -78,50 +78,47 @@ fi
 WORKDIR="${WORKDIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 RUN_ROOT="${WORKDIR}/.slurm-smoke-${SLURM_JOB_ID}"
 mkdir -p "${RUN_ROOT}"
-export WORKDIR PREFIX SMOKE_NONCES RUN_ROOT TASKS
+export WORKDIR PREFIX SMOKE_NONCES SMOKE_SECONDS RUN_ROOT TASKS
 
 start_epoch="$(date +%s)"
-deadline=$((start_epoch + SMOKE_SECONDS))
-runs=0
-total_nonces=0
 
 echo "=== ${SMOKE_SECONDS}s multi-node smoke test ==="
-echo "prefix=${PREFIX}, nodes=2, gpus=16, nonces/rank=${SMOKE_NONCES}"
-while true; do
-    now="$(date +%s)"
-    if (( runs > 0 && now >= deadline )); then
-        break
-    fi
-
-    run_index="${runs}"
-    mkdir -p "${RUN_ROOT}/run-${run_index}"
-    export RUN_INDEX="${run_index}"
-    srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
-        --kill-on-bad-exit=1 \
-        --output="${RUN_ROOT}/run-${run_index}/rank-%t.out" \
-        --error="${RUN_ROOT}/run-${run_index}/rank-%t.err" \
-        bash -c '
-            set -euo pipefail
-            rank_dir="${RUN_ROOT}/run-${RUN_INDEX}/rank-${SLURM_PROCID}"
-            mkdir -p "${rank_dir}"
-            cd "${rank_dir}"
-            start_nonce="$((RUN_INDEX * TASKS * SMOKE_NONCES + SLURM_PROCID * SMOKE_NONCES))"
-            exec "${WORKDIR}/collision" --smoke --start "${start_nonce}" "${PREFIX}" "${SMOKE_NONCES}"
-        '
-    runs=$((runs + 1))
-    total_nonces=$((total_nonces + TASKS * SMOKE_NONCES))
-done
+echo "prefix=${PREFIX}, nodes=2, gpus=16, batch/rank=${SMOKE_NONCES}"
+echo "one srun launch; each rank runs continuous mode for ${SMOKE_SECONDS}s"
+srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
+    --kill-on-bad-exit=1 \
+    --output="${RUN_ROOT}/rank-%t.out" \
+    --error="${RUN_ROOT}/rank-%t.err" \
+    bash -c '
+        set -euo pipefail
+        rank_dir="${RUN_ROOT}/rank-${SLURM_PROCID}"
+        mkdir -p "${rank_dir}"
+        cd "${rank_dir}"
+        start_nonce="$((SLURM_PROCID * 1000000000000))"
+        set +e
+        timeout --signal=INT --kill-after=8s "${SMOKE_SECONDS}s" \
+            env BATCH_NONCES="${SMOKE_NONCES}" "${WORKDIR}/collision" \
+            --start "${start_nonce}" "${PREFIX}"
+        rc=$?
+        set -e
+        if [[ "${rc}" -ne 0 && "${rc}" -ne 124 && "${rc}" -ne 130 ]]; then
+            exit "${rc}"
+        fi
+    '
 
 end_epoch="$(date +%s)"
 elapsed=$((end_epoch - start_epoch))
 (( elapsed > 0 )) || elapsed=1
 
 shopt -s nullglob
-log_files=("${RUN_ROOT}"/run-*/rank-*.out)
-solution_files=("${RUN_ROOT}"/run-*/rank-*/solution_*.csv)
+log_files=("${RUN_ROOT}"/rank-*.out)
+solution_files=("${RUN_ROOT}"/rank-*/solution_*.csv)
 max_qbit=0
+total_nonces=0
 if (( ${#log_files[@]} > 0 )); then
     max_qbit="$(awk '/目前最多共同前綴 qbit：/ { split($0, p, "："); split(p[2], q, "（"); v=q[1]+0; if (v > max) max=v } END { print max+0 }' "${log_files[@]}")"
+    total_nonces="$(grep -hEo '收到停止訊號，已完成 [0-9]+' "${log_files[@]}" \
+        | awk '{sum+=$2} END {print sum+0}')"
 fi
 
 best_bits=0
@@ -139,7 +136,7 @@ if [[ -n "${best_file}" ]]; then
 fi
 
 echo "=== smoke summary ==="
-echo "completed_runs=${runs}"
+echo "completed_runs=1"
 echo "completed_nonces=${total_nonces}"
 echo "elapsed_seconds=${elapsed}"
 echo "current_max_qbit_prefix=${max_qbit}"

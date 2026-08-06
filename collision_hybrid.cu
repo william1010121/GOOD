@@ -40,9 +40,7 @@
 #include <omp.h>
 #include <mpi.h>
 
-#include <thrust/sort.h>
-#include <thrust/execution_policy.h>
-#include <thrust/device_ptr.h>
+#include <cub/cub.cuh>
 
 #define CUDA_CHECK(call) do {                                              \
     cudaError_t _e = (call);                                               \
@@ -167,16 +165,11 @@ __device__ __forceinline__ void put_nonce(uint32_t w[16], int nonce_word,
 //   （這正是 collision.cu 結尾註解建議的方向之一。）
 // =====================================================================
 typedef struct { uint64_t hi, nonce; } E16;
-
-struct E16Less {
-    __host__ __device__ bool operator()(const E16 &a, const E16 &b) const {
-        if (a.hi != b.hi) return a.hi < b.hi;
-        return a.nonce < b.nonce;          // 讓相同 hi 的順序是確定的
-    }
-};
+typedef struct { int bits, valid; uint64_t a, b; } Candidate16;
 
 __global__ void hash_kernel16(const uint32_t *base_words, int nonce_word, int nonce_shift,
-                              uint64_t start_nonce, uint32_t count, E16 *out) {
+                              uint64_t start_nonce, uint32_t count,
+                              uint64_t *out_hi, uint64_t *out_nonce) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
     uint64_t nonce = start_nonce + idx;
@@ -186,8 +179,20 @@ __global__ void hash_kernel16(const uint32_t *base_words, int nonce_word, int no
     put_nonce(w, nonce_word, nonce_shift, nonce);
     uint32_t hash[8];
     sha256_block(w, hash);
-    out[idx].hi    = ((uint64_t)hash[0] << 32) | hash[1];
-    out[idx].nonce = nonce;
+    out_hi[idx]    = ((uint64_t)hash[0] << 32) | hash[1];
+    out_nonce[idx] = nonce;
+}
+
+__global__ void pack_e16_kernel(const uint64_t *hi, const uint64_t *nonce,
+                                E16 *out, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = E16{hi[i], nonce[i]};
+}
+
+__global__ void unpack_e16_kernel(const E16 *in, uint64_t *hi,
+                                  uint64_t *nonce, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { hi[i] = in[i].hi; nonce[i] = in[i].nonce; }
 }
 
 // 只用 hi 算共同前綴（上限 64）。hi 相同時回傳 64，代表「需要看 lo」。
@@ -197,8 +202,6 @@ static int prefix_bits_hi(uint64_t a, uint64_t b) {
 }
 
 #define MAX_LAUNCH (1500000000u)
-#define PACK_IDX_BITS 40
-
 // ---------------------------------------------------------------------
 // 第 1 步：一張 GPU 算一段 nonce 的雜湊，裝置端排序後搬回主機。
 // ---------------------------------------------------------------------
@@ -206,9 +209,18 @@ static std::vector<E16> run_shard16(int gpu_id, const uint32_t base_words[16],
                                     int nonce_word, int nonce_shift,
                                     uint64_t start_nonce, uint64_t count) {
     CUDA_CHECK(cudaSetDevice(gpu_id));
-    uint32_t *d_base = nullptr; E16 *d = nullptr;
+    if (count > 0x7fffffffULL) {
+        fprintf(stderr, "單 GPU shard 超過 CUB int item 上限\n");
+        exit(1);
+    }
+    uint32_t *d_base = nullptr;
+    uint64_t *d_hi_in = nullptr, *d_hi_out = nullptr;
+    uint64_t *d_nonce_in = nullptr, *d_nonce_out = nullptr;
     CUDA_CHECK(cudaMalloc(&d_base, 16 * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d, count * sizeof(E16)));
+    CUDA_CHECK(cudaMalloc(&d_hi_in, count * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_hi_out, count * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_nonce_in, count * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_nonce_out, count * sizeof(uint64_t)));
     CUDA_CHECK(cudaMemcpy(d_base, base_words, 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
     uint64_t done = 0;
@@ -216,19 +228,37 @@ static std::vector<E16> run_shard16(int gpu_id, const uint32_t base_words[16],
         uint32_t batch = (uint32_t)std::min<uint64_t>(count - done, MAX_LAUNCH);
         int threads = 256, blocks = (int)((batch + threads - 1) / threads);
         hash_kernel16<<<blocks, threads>>>(d_base, nonce_word, nonce_shift,
-                                           start_nonce + done, batch, d + done);
+                                           start_nonce + done, batch,
+                                           d_hi_in + done, d_nonce_in + done);
         done += batch;
     }
     CUDA_CHECK(cudaGetLastError());
 
-    thrust::device_ptr<E16> dp(d);
-    thrust::sort(thrust::device, dp, dp + count, E16Less());
+    size_t temp_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_bytes, d_hi_in, d_hi_out, d_nonce_in, d_nonce_out,
+        (int)count, 0, 64));
+    void *d_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        d_temp, temp_bytes, d_hi_in, d_hi_out, d_nonce_in, d_nonce_out,
+        (int)count, 0, 64));
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    CUDA_CHECK(cudaFree(d_temp));
+    CUDA_CHECK(cudaFree(d_hi_in));
+    CUDA_CHECK(cudaFree(d_nonce_in));
+    E16 *d_packed = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_packed, count * sizeof(E16)));
+    int pack_blocks = (int)((count + 255) / 256);
+    pack_e16_kernel<<<pack_blocks, 256>>>(d_hi_out, d_nonce_out, d_packed, count);
+    CUDA_CHECK(cudaGetLastError());
     std::vector<E16> h(count);
-    CUDA_CHECK(cudaMemcpy(h.data(), d, count * sizeof(E16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h.data(), d_packed, count * sizeof(E16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_packed));
+    CUDA_CHECK(cudaFree(d_hi_out));
+    CUDA_CHECK(cudaFree(d_nonce_out));
     CUDA_CHECK(cudaFree(d_base));
-    CUDA_CHECK(cudaFree(d));
     return h;
 }
 
@@ -238,42 +268,58 @@ struct Seq { const E16 *p; size_t n; };
 // 掃相鄰對。hi 不同 -> clz 直接得到精確 bits（必定 < 64）。
 // hi 相同 -> 當場重算兩個 nonce 的 SHA-256 取 lo，補到 128 bits。
 // ---------------------------------------------------------------------
-__global__ void adj_max16(const E16 *e, uint64_t n, const uint32_t *base_words,
-                          int nonce_word, int nonce_shift, unsigned long long *out) {
-    extern __shared__ unsigned long long sh[];
-    unsigned long long best = 0;
+__device__ __forceinline__ Candidate16 better16(Candidate16 a, Candidate16 b) {
+    if (a.valid != b.valid) return a.valid ? a : b;
+    return (!a.valid || a.bits >= b.bits) ? a : b;
+}
+
+__device__ __forceinline__ int exact_bits16(uint64_t hi_a, uint64_t nonce_a,
+                                             uint64_t hi_b, uint64_t nonce_b,
+                                             const uint32_t *base_words,
+                                             int nonce_word, int nonce_shift) {
+    uint64_t x = hi_a ^ hi_b;
+    if (x) return __clzll((long long)x);
+    uint32_t w[16], h1[8], h2[8];
+#pragma unroll
+    for (int k = 0; k < 16; k++) w[k] = base_words[k];
+    put_nonce(w, nonce_word, nonce_shift, nonce_a); sha256_block(w, h1);
+#pragma unroll
+    for (int k = 0; k < 16; k++) w[k] = base_words[k];
+    put_nonce(w, nonce_word, nonce_shift, nonce_b); sha256_block(w, h2);
+    uint64_t lo1 = ((uint64_t)h1[2] << 32) | h1[3];
+    uint64_t lo2 = ((uint64_t)h2[2] << 32) | h2[3];
+    uint64_t y = lo1 ^ lo2;
+    return y ? 64 + __clzll((long long)y) : 128;
+}
+
+__global__ void adj_max16(const uint64_t *hi, const uint64_t *nonce, uint64_t n,
+                          const uint32_t *base_words, int nonce_word,
+                          int nonce_shift, Candidate16 *block_best) {
+    extern __shared__ Candidate16 sh[];
+    Candidate16 best{0, 0, 0, 0};
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i + 1 < n; i += stride) {
-        if (e[i].nonce == e[i + 1].nonce) continue;
-        uint64_t x = e[i].hi ^ e[i + 1].hi;
-        int b;
-        if (x) {
-            b = __clzll((long long)x);                 // 常見路徑：< 64 bits
+        if (hi[i] == hi[i + 1]) {
+            for (uint64_t j = i + 1; j < n && hi[j] == hi[i]; ++j) {
+                if (nonce[i] == nonce[j]) continue;
+                Candidate16 c{exact_bits16(hi[i], nonce[i], hi[j], nonce[j],
+                                           base_words, nonce_word, nonce_shift),
+                              1, nonce[i], nonce[j]};
+                best = better16(best, c);
+            }
         } else {
-            uint32_t w[16], h1[8], h2[8];              // 罕見路徑：hi 全同，回頭算 lo
-#pragma unroll
-            for (int k = 0; k < 16; k++) w[k] = base_words[k];
-            put_nonce(w, nonce_word, nonce_shift, e[i].nonce);
-            sha256_block(w, h1);
-#pragma unroll
-            for (int k = 0; k < 16; k++) w[k] = base_words[k];
-            put_nonce(w, nonce_word, nonce_shift, e[i + 1].nonce);
-            sha256_block(w, h2);
-            uint64_t lo1 = ((uint64_t)h1[2] << 32) | h1[3];
-            uint64_t lo2 = ((uint64_t)h2[2] << 32) | h2[3];
-            uint64_t y = lo1 ^ lo2;
-            b = y ? 64 + __clzll((long long)y) : 128;
+            Candidate16 c{__clzll((long long)(hi[i] ^ hi[i + 1])), 1,
+                          nonce[i], nonce[i + 1]};
+            best = better16(best, c);
         }
-        unsigned long long p = ((unsigned long long)b << PACK_IDX_BITS) | (unsigned long long)i;
-        if (p > best) best = p;
     }
     sh[threadIdx.x] = best;
     __syncthreads();
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s && sh[threadIdx.x + s] > sh[threadIdx.x]) sh[threadIdx.x] = sh[threadIdx.x + s];
+        if (threadIdx.x < s) sh[threadIdx.x] = better16(sh[threadIdx.x], sh[threadIdx.x + s]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) atomicMax(out, sh[0]);
+    if (threadIdx.x == 0) block_best[blockIdx.x] = sh[0];
 }
 
 struct SliceResult { int bits; uint64_t a, b; bool empty; E16 first, last; };
@@ -287,42 +333,62 @@ static SliceResult scan_slice16(int gpu_id, const std::vector<Seq> &seqs,
     SliceResult r; r.bits = 0; r.a = 0; r.b = 0; r.empty = (n == 0);
     if (n == 0) return r;
 
-    E16 *d = nullptr;
-    CUDA_CHECK(cudaMalloc(&d, n * sizeof(E16)));
+    if (n > 0x7fffffffULL) { fprintf(stderr, "slice 超過 CUB int item 上限\n"); exit(1); }
+    E16 *d_packed = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_packed, n * sizeof(E16)));
     uint64_t off = 0;
     for (size_t s = 0; s < seqs.size(); s++) {
         uint64_t len = (uint64_t)(hi_[s] - lo[s]);
         if (!len) continue;
-        CUDA_CHECK(cudaMemcpy(d + off, seqs[s].p + lo[s], len * sizeof(E16), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_packed + off, seqs[s].p + lo[s], len * sizeof(E16), cudaMemcpyHostToDevice));
         off += len;
     }
-    thrust::device_ptr<E16> dp(d);
-    thrust::sort(thrust::device, dp, dp + n, E16Less());
+    uint64_t *d_hi_in = nullptr, *d_hi_out = nullptr;
+    uint64_t *d_nonce_in = nullptr, *d_nonce_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_hi_in, n * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_nonce_in, n * sizeof(uint64_t)));
+    unpack_e16_kernel<<<(int)((n + 255) / 256), 256>>>(d_packed, d_hi_in, d_nonce_in, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFree(d_packed));
+    CUDA_CHECK(cudaMalloc(&d_hi_out, n * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_nonce_out, n * sizeof(uint64_t)));
+    size_t temp_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr, temp_bytes,
+        d_hi_in, d_hi_out, d_nonce_in, d_nonce_out, (int)n, 0, 64));
+    void *d_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(d_temp, temp_bytes,
+        d_hi_in, d_hi_out, d_nonce_in, d_nonce_out, (int)n, 0, 64));
+    CUDA_CHECK(cudaFree(d_temp));
+    CUDA_CHECK(cudaFree(d_hi_in)); CUDA_CHECK(cudaFree(d_nonce_in));
 
-    uint32_t *d_base = nullptr; unsigned long long *d_best = nullptr;
+    uint32_t *d_base = nullptr; Candidate16 *d_block_best = nullptr;
     CUDA_CHECK(cudaMalloc(&d_base, 16 * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_base, base_words, 16 * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&d_best, sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMemset(d_best, 0, sizeof(unsigned long long)));
+    const int blocks = 2048, threads = 256;
+    CUDA_CHECK(cudaMalloc(&d_block_best, blocks * sizeof(Candidate16)));
     if (n >= 2) {
-        int threads = 256, blocks = 2048;
-        adj_max16<<<blocks, threads, threads * sizeof(unsigned long long)>>>(
-            d, n, d_base, nonce_word, nonce_shift, d_best);
+        adj_max16<<<blocks, threads, threads * sizeof(Candidate16)>>>(
+            d_hi_out, d_nonce_out, n, d_base, nonce_word, nonce_shift, d_block_best);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-    unsigned long long packed = 0;
-    CUDA_CHECK(cudaMemcpy(&packed, d_best, sizeof(packed), cudaMemcpyDeviceToHost));
-    if (packed) {
-        uint64_t i = packed & ((1ULL << PACK_IDX_BITS) - 1);
-        E16 two[2];
-        CUDA_CHECK(cudaMemcpy(two, d + i, 2 * sizeof(E16), cudaMemcpyDeviceToHost));
-        r.bits = (int)(packed >> PACK_IDX_BITS);
-        r.a = two[0].nonce; r.b = two[1].nonce;
-    }
-    CUDA_CHECK(cudaMemcpy(&r.first, d, sizeof(E16), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&r.last, d + (n - 1), sizeof(E16), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_best)); CUDA_CHECK(cudaFree(d_base)); CUDA_CHECK(cudaFree(d));
+    std::vector<Candidate16> host_best(blocks);
+    CUDA_CHECK(cudaMemcpy(host_best.data(), d_block_best,
+                          blocks * sizeof(Candidate16), cudaMemcpyDeviceToHost));
+    Candidate16 best{0, 0, 0, 0};
+    for (const Candidate16 &c : host_best)
+        if (c.valid && (!best.valid || c.bits > best.bits)) best = c;
+    if (best.valid) { r.bits = best.bits; r.a = best.a; r.b = best.b; }
+    uint64_t edge_hi[2], edge_nonce[2];
+    CUDA_CHECK(cudaMemcpy(&edge_hi[0], d_hi_out, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&edge_nonce[0], d_nonce_out, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&edge_hi[1], d_hi_out + n - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&edge_nonce[1], d_nonce_out + n - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    r.first = E16{edge_hi[0], edge_nonce[0]};
+    r.last = E16{edge_hi[1], edge_nonce[1]};
+    CUDA_CHECK(cudaFree(d_block_best)); CUDA_CHECK(cudaFree(d_base));
+    CUDA_CHECK(cudaFree(d_hi_out)); CUDA_CHECK(cudaFree(d_nonce_out));
     return r;
 }
 
@@ -497,4 +563,3 @@ int main(int argc, char **argv) {
 //    減少要保存的筆數），犧牲一點理論最優性換取能掃過遠大於記憶體
 //    上限的搜尋空間。這屬於 exact 解法之外的進階/機率性做法。
 // =====================================================================
-

@@ -166,6 +166,17 @@ static int common_prefix_bits(const Entry *a, const Entry *b) {
     return 128;                                         // 前 128 bits 完全相同
 }
 
+// 單調時鐘：用於量 CPU 階段與端到端時間，不受系統時間調整影響。
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static double throughput_mhps(uint64_t count, double seconds) {
+    return (seconds > 0.0) ? ((double)count / seconds / 1e6) : 0.0;
+}
+
 // =====================================================================
 // ★★★ 輸出檔案格式 —— 請勿修改 ★★★
 //
@@ -230,16 +241,43 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMalloc(&d_nonce, bytes64));
     CUDA_CHECK(cudaMemcpy(d_base, base_words, sizeof(base_words), cudaMemcpyHostToDevice));
 
-    time_t t_start = time(NULL);
+    // CUDA event 只量 GPU kernel 本身；CPU 單調時鐘量整體時間。
+    cudaEvent_t hash_start, hash_stop;
+    CUDA_CHECK(cudaEventCreate(&hash_start));
+    CUDA_CHECK(cudaEventCreate(&hash_stop));
+    double total_start = monotonic_seconds();
 
     // ---- 第 1 步：GPU 平行計算所有雜湊 ----
     int threads = 256;
-    int blocks  = (int)((n + threads - 1) / threads);
+    const uint64_t report_every = 10000000ULL;
+    double hash_seconds = 0.0;
+    uint64_t done = 0;
     printf("[1/3] GPU 計算 %llu 個雜湊 …\n", (unsigned long long)total);
-    hash_kernel<<<blocks, threads>>>(d_base, nonce_word, nonce_shift,
-                                     0, (uint32_t)n, d_hi, d_lo, d_nonce);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    while (done < total) {
+        uint32_t count = (uint32_t)(((total - done) > report_every) ?
+                                    report_every : (total - done));
+        int blocks = (count + threads - 1) / threads;
+
+        CUDA_CHECK(cudaEventRecord(hash_start));
+        hash_kernel<<<blocks, threads>>>(d_base, nonce_word, nonce_shift,
+                                         done, count,
+                                         d_hi + done, d_lo + done,
+                                         d_nonce + done);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(hash_stop));
+        CUDA_CHECK(cudaEventSynchronize(hash_stop));
+
+        float batch_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&batch_ms, hash_start, hash_stop));
+        hash_seconds += (double)batch_ms / 1000.0;
+        done += count;
+
+        printf("[進度] %llu/%llu (%.1f%%)，吞吐量 %.2f MH/s\n",
+               (unsigned long long)done, (unsigned long long)total,
+               100.0 * (double)done / (double)total,
+               throughput_mhps(done, monotonic_seconds() - total_start));
+        fflush(stdout);
+    }
 
     // ---- 第 2 步：複製回 CPU 並排序 ----
     //   ★ 優化點（最重要）：這一步是瓶頸，整段期間 GPU 閒置。
@@ -276,12 +314,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    double elapsed = difftime(time(NULL), t_start);
+    double total_seconds = monotonic_seconds() - total_start;
     printf("----------------------------------------\n");
     printf("最佳結果：共同前綴 %d bits\n", best_bits);
     printf("nonce_a : %llu\n", (unsigned long long)best_a);
     printf("nonce_b : %llu\n", (unsigned long long)best_b);
-    printf("耗時    : %.0f 秒\n", elapsed);
+    printf("耗時    : %.3f 秒\n", total_seconds);
+    printf("吞吐量  : GPU hash %.2f MH/s，整體 %.2f MH/s\n",
+           throughput_mhps(total, hash_seconds),
+           throughput_mhps(total, total_seconds));
 
     write_solution(prefix, best_a, best_b, best_bits);
 
@@ -291,5 +332,7 @@ int main(int argc, char **argv) {
 
     free(entries); free(h_hi); free(h_lo); free(h_nonce);
     cudaFree(d_base); cudaFree(d_hi); cudaFree(d_lo); cudaFree(d_nonce);
+    cudaEventDestroy(hash_start);
+    cudaEventDestroy(hash_stop);
     return 0;
 }

@@ -90,6 +90,16 @@ nvcc -O3 -Xcompiler -fopenmp -arch=sm_90 collision.cu -o collision
 ./collision hipac_demo 500000000     # 掃 5 億個
 ```
 
+### Slurm 1 分鐘 smoke test
+
+`smoke_test.slurm` 會先編譯，再重複完成固定大小的掃描批次，直到達到 60 秒，最後輸出整體彙總吞吐量：
+
+```bash
+sbatch --export=ALL,PREFIX=hipac_demo,SMOKE_NONCES=20000000,SMOKE_SECONDS=60 smoke_test.slurm
+```
+
+若叢集沒有自動找到 CUDA，可設定 `CUDA_MODULE`；若要指定 GPU 架構，可設定 `ARCH=sm_90`。工作目錄預設使用 `SLURM_SUBMIT_DIR`，也可用 `WORKDIR` 覆寫。
+
 輸出範例：
 
 ```

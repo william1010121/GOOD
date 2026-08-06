@@ -118,9 +118,12 @@ info:
 	@echo "實際旗標       : $(CFLAGS) $(ARCH_FLAGS)"
 
 run: $(TARGET)
-	./$(TARGET) --smoke HiPAC2026crypto 20000000
+	./$(TARGET) --seconds 60 HiPAC2026crypto
+
+bench: $(TARGET)
+	./$(TARGET) --bench HiPAC2026crypto
 
 clean:
 	rm -f $(TARGET) solution_*.csv
 
-.PHONY: all preflight info run clean
+.PHONY: all preflight info run bench clean

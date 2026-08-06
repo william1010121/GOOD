@@ -1,194 +1,140 @@
-# 隱藏題1：SHA-256 部分碰撞搜尋 — 參賽說明
+# 隱藏題1：SHA-256 部分碰撞搜尋
 
-## 題目在做什麼
+## 題目
 
-雜湊函數的重要性質之一是「抗碰撞」：要找到兩個不同的輸入卻得到相同的雜湊值，
-理論上極其困難。但如果只要求「**開頭一部分相同**」，難度就會大幅下降 ——
-這就是所謂的**生日攻擊**。
+對每個 64 位元整數 `nonce` 定義 `hash(nonce) = SHA-256( prefix(ASCII) ‖ nonce(8 bytes 大端) )`，
+找出兩個**不同的** nonce，讓兩個雜湊**開頭相同的 bits 最多**。正式 prefix 是 `HiPAC2026crypto`。
 
-本題給定一個固定字串 `prefix`，對每個 64 位元整數 `nonce` 定義：
-
-```
-hash(nonce) = SHA-256( prefix(ASCII) ‖ nonce(8 bytes 大端) )
-```
-
-你的任務是找出**兩個不同的** nonce `a` 與 `b`，讓 `hash(a)` 與 `hash(b)`
-**開頭有最多相同的 bits**。相同的 bits 越多，分數越高。
-
-### 範例
-
-```
-prefix = "hipac_demo"
-
-nonce_a = 13644422  →  429a8698aa53 6775ad1d418b19e7a371...
-nonce_b = 18436129  →  429a8698aa53 757e2b88e18b43e4a445...
-                       └── 共同前綴 51 bits ──┘
-```
-
-這組的成績就是「共同前綴 = 51 bits」。
+計分：共同前綴達 **58 bits** 得基礎分 4 分，未達為 0 分；再依 bits 排名加 0～6 分。
 
 ---
 
-## 範本程式在做什麼
-
-`collision.cu` 已經是一支**可以正確執行**的程式，分三步：
-
-1. **GPU 平行計算雜湊** —— 每個執行緒算一個 nonce 的 SHA-256，
-   取雜湊的前 128 bits 當作排序鍵。
-2. **複製回 CPU 並排序** —— 用標準的 `qsort` 依雜湊值排序。
-3. **掃描相鄰配對** —— 排序後相鄰的兩筆最可能有長共同前綴，掃一遍找最佳。
-
-> 這支範本**能跑，但沒有特別快**。讓它更快就是你的任務。
-
----
-
-## 如何編譯
-
-需要 NVIDIA GPU 與 CUDA Toolkit（`nvcc`）。
+## 怎麼跑
 
 ```bash
 make
+sbatch run_collision.slurm          # 2 nodes × 8 GPU，跑 240 秒
 ```
 
-`make` 會自動偵測 GPU 架構。偵測不到時（例如在沒有 GPU 的登入節點編譯），
-會自動改編「多架構通用版」，換到哪張卡都能跑，只是編譯久一點。
+結果會在提交目錄產生 `solution_<bits>.csv`，並自動用 `verify_collision.py` 驗過。
 
-想手動指定：
+可調參數：
 
 ```bash
-make ARCH=sm_90     # H200 / H100
-make ARCH=sm_80     # A100
+sbatch --export=ALL,SEARCH_SECONDS=240,PREFIX=HiPAC2026crypto,NONCE_START=0 run_collision.slurm
 ```
 
-編譯出問題時，先跑這個把環境資訊印出來：
+- `SEARCH_SECONDS` — 生成階段秒數。Slurm 上限設在 5 分鐘，預設 240 秒留收尾邊際。
+- `NONCE_START` — 換一個值就是一輪**完全獨立**的搜尋。分數的標準差約 1.9 bits，
+  多跑幾輪取最好可以多撈 2～3 bits。
+
+單機直接跑（會用光本機所有 GPU）：
 
 ```bash
-make info
-```
-
-也可以完全不用 make，直接編：
-
-```bash
-nvcc -O3 -Xcompiler -fopenmp -arch=sm_90 collision.cu -o collision
-```
-
-> `-Xcompiler -fopenmp` 範本本身用不到，但優化方向之一是多 GPU，
-> 而多 GPU 最自然的寫法就是 OpenMP，先開著省得之後卡在連結錯誤。
-
----
-
-## 如何執行
-
-一般模式不使用 `total`，會持續以固定 batch 掃描，直到收到 `Ctrl-C`；每批完成後會回報目前找到的最高共同前綴 qbit 數量。每批大小可用 `BATCH_NONCES` 調整：
-
-```bash
-BATCH_NONCES=20000000 ./collision HiPAC2026crypto
-```
-
-只有明確加上 `--smoke` 才使用固定的 `total`，並在完成後結束：
-
-```bash
-./collision --smoke HiPAC2026crypto 20000000
-```
-
-### Slurm 1 分鐘 smoke test
-
-`smoke_test.slurm` 會先編譯，再以 2 個 node、每個 node 8 張 GPU（共 16 張）執行 `--smoke`，重複完成固定大小的掃描批次直到達到 60 秒，最後輸出整體彙總吞吐量與目前最高 qbit 前綴：
-
-```bash
-sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,SMOKE_SECONDS=60 smoke_test.slurm
-```
-
-若叢集沒有自動找到 CUDA，可設定 `CUDA_MODULE`；若要指定 GPU 架構，可設定 `ARCH=sm_90`。工作目錄預設使用 `SLURM_SUBMIT_DIR`，也可用 `WORKDIR` 覆寫。
-
-輸出範例：
-
-```
-使用 GPU: NVIDIA H200（132 個 SM）
-prefix = "hipac_demo"    掃描 20000000 個 nonce
-
-需要記憶體：GPU 0.48 GB，CPU 0.96 GB
-
-[1/3] GPU 計算 20000000 個雜湊 …
-[2/3] 複製回主機並排序 …
-[3/3] 掃描相鄰配對 …
-
-----------------------------------------
-最佳結果：共同前綴 51 bits
-nonce_a : 13644422
-nonce_b : 18436129
-耗時    : 6 秒
-答案已寫入 solution_51.csv
-
-驗證指令：
-  python3 verify_collision.py -p hipac_demo -a 13644422 -b 18436129
-```
-
-## 如何驗證答案
-
-```bash
-python3 verify_collision.py -p <prefix> -a <nonce_a> -b <nonce_b>
-```
-
-或直接讀繳交檔（會一併檢查 `match_bits` 是否與實際相符）：
-
-```bash
-python3 verify_collision.py --file solution_51.csv
+./collision --seconds 240 HiPAC2026crypto
+./collision --bench HiPAC2026crypto      # 只量 SHA-256 吞吐
 ```
 
 ---
 
-## ⚠ 輸出檔案格式（不可修改）
+## 演算法
 
-程式找到結果時會產生一個 CSV 檔，**這就是評分系統讀取的檔案**：
+分數 ≈ `2·log₂(N)`，N 是能互相比對的雜湊數。記憶體裝不下 N，
+所以用 **partition-by-regeneration**：
 
-- **檔名**：`solution_<共同前綴bits>.csv`，例如 `solution_51.csv`
-- **內容**：第一行欄位名，第二行資料
+1. 把雜湊空間依「前 p bits」切成 `P = 2^p` 個 partition。
+2. 每個 partition 重掃整段 nonce 範圍，**只留落在該桶的**，在 GPU 內排序、掃相鄰對。
+3. 換下一個 partition。
+
+正確性：全域最佳那對的共同前綴遠大於 p，所以它們的前 p bits 必然相同、必在同一桶，
+分桶不會漏掉答案。
+
+設每桶能容納 H 筆、時限內全叢集能生成 G 個雜湊：
+
+```
+期望分數 ≈ log₂(H) + log₂(G) − 1
+```
+
+這個式子**與掃描範圍 S 無關**（只要 S 大到 partition 跑不完），所以猜錯 GPU 速度
+不會毀掉這一趟，只會少做幾個桶。程式啟動時會自己量吞吐、自己決定 P 和 S。
+
+### 相對範本改了什麼
+
+| # | 改動 | 為什麼 |
+|---|---|---|
+| 1 | **單一長時間執行的 process** | 舊版每 20M nonce 重啟一次，CUDA context 初始化吃掉 99.9% 的時間——實測 10.5 GH/s 的卡端到端只剩 4.44 MH/s |
+| 2 | **生成 + 分桶融合成單一 kernel** | 雜湊不再完整落地 HBM 又讀回，省一整趟頻寬，也讓峰值記憶體與掃描量脫鉤 |
+| 3 | **排序與比對全在 GPU** | CUB radix sort + 相鄰掃描，不再複製回主機 qsort |
+| 4 | **一個 process 開滿本機 8 張 GPU** | OpenMP 一 thread 綁一張卡，一個 node 只付一次啟動成本 |
+| 5 | **跨 batch 共用比較池** | 舊版每批各排各的，batch 之間從不互相比較，白白損失 log₂(批數) bits |
+
+註：刻意**不做** sort 與生成的重疊。排序只佔每個 partition 約 0.5% 的時間，
+但雙緩衝會讓 H 減半（= 少 1 分），不划算。
+
+---
+
+## 輸出格式（不可修改）
+
+程式找到結果時產生 `solution_<共同前綴bits>.csv`，這是評分系統讀取的檔案：
 
 ```
 prefix,nonce_a,nonce_b,match_bits
-hipac_demo,13644422,18436129,51
+HiPAC2026crypto,1643364251,4721853729,63
 ```
 
-規則：
+`write_solution()` 標明「請勿修改」，維持原樣。`match_bits` 是用凍結的
+`sha256_block` 重算完整 256-bit 雜湊後算出的**精確值**，與 `verify_collision.py` 一致。
 
-- 檔名規則、欄位名、欄位順序都不可更動。
-- 程式裡的 `write_solution()` 函式已標明「**請勿修改**」，請保持原樣。
-- 你可以自由改寫程式的其他部分（甚至完全重寫演算法），但**只要輸出的 CSV
-  格式對不上，評分系統就讀不到，該筆提交以 0 分計**。
+驗證：
 
----
-
-## 可以動哪些地方（優化方向）
-
-### 哪些不能改
-
-程式分成兩區，中間有分隔標記：
-
-- **【不可修改區】** —— `sha256_block()`、`build_base_words()`、`put_nonce()`。
-  本題比的是資料處理與平行化的效率，不是密碼學實作，所以雜湊部分統一固定。
-- **【開放區】** —— 其餘全部隨你改寫。
-
-### 三個方向
-
-程式裡標了 `★ 優化點` 的三個地方：
-
-- **（最重要）** 複製回主機並排序這一步是瓶頸，整段期間 GPU 閒置。
-- 範本一次把所有雜湊都存起來，記憶體會成為掃描量的上限。每筆 24 bytes，掃 10 億個需要 24 GB。
-- 範本只用 1 張 GPU，比賽機器有多張。
-
-開放區可以自由改寫，甚至完全重寫 —— 只要：
-
-- **不可修改區**維持原樣
-- 提交的 `(nonce_a, nonce_b)` 是**兩個不同的值**，且能通過 `verify_collision.py`
-- 輸出的 CSV 格式不變（見上一節）
-- 程式在 10 分鐘內執行完畢
+```bash
+python3 verify_collision.py --file solution_63.csv
+```
 
 ---
 
-## 繳交與計分
+## 不可修改區
 
-- **繳交內容**：程式產生的 `solution_<bits>.csv`（共同前綴越長越好）。
-- **輸出格式不可修改**，格式錯誤該筆以 0 分計。
-- **比賽時間內可重複提交**，取最佳的一次。
-- 計分方式以主辦方公告為準（基本分 + 依名次的排名分）。
+`sha256_block()`、`build_base_words()`、`put_nonce()`、`write_solution()` 與 CSV 格式
+全部維持原樣。開放區（kernel 排程、記憶體配置、排序、多 GPU）已完全重寫。
+
+---
+
+## 調校旋鈕
+
+| 旋鈕 | 預設 | 說明 |
+|---|---|---|
+| `MAX_SORT_ITEMS` | 無上限 | 單次 CUB 排序筆數上限。CUDA 12.9 的 `cub/detail/choose_offset.cuh` 對 `size_t` 會選 64-bit offset，所以沒有 2^31 限制，預設就吃滿顯存 |
+| `-DHIPAC_TPB=` | 256 | 每 block thread 數 |
+| `--partitions` / `--span` | 自動 | 強制覆寫自動推算的 P 與 S |
+
+---
+
+## 已知實測與推估
+
+| 硬體 | 設定 | 結果 |
+|---|---|---|
+| 1 × RTX 5060 Laptop | 25 秒 · 2.7 GH/s · H = 0.18 G | **63 bits**（模型預測 62.5） |
+| 1 × H200 | 原始 SHA-256 吞吐 | 10.3–10.8 GH/s |
+
+16 × H200 推估（H = 3.5 G 筆/桶）：
+
+| 生成秒數 | log₂(G) | 期望分數 |
+|---|---|---|
+| 240 s | 45.2 | **~76 bits** |
+| 540 s | 46.4 | **~77 bits** |
+
+### 通往 80 bits
+
+分數 = `log₂(H) + log₂(G) − 1`。G 由硬體與時間決定，時間翻倍只值 +1 分。
+**缺口全在 H。** 單卡 HBM 已吃滿，唯一的放大途徑是**節點內 8 卡用 NVLink 協同排序**：
+
+| 改動 | 增益 | 累計 |
+|---|---|---|
+| 現況（單卡各自分桶，240 s） | — | ~76 |
+| 跑滿 540 s | +1.2 | ~77 |
+| 節點內 8 卡協同排序（H ×8） | +3.0 | **~80** |
+
+協同排序的成本：每個桶要做一次 NVLink all-to-all 把 key 送到 owner GPU。
+桶大小 2.9 G 筆 × 16 B = 464 GB，以 ~300 GB/s 有效頻寬約 1.5 秒，
+相對每桶約 22 秒的生成時間約 7%，划算。

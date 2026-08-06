@@ -78,7 +78,7 @@ $(TARGET): $(SOURCES) | preflight
 	@echo ""
 	@echo ">>> 編譯完成。執行方式："
 	@echo "      ./$(TARGET) [prefix]"
-	@echo "    smoke 例： ./$(TARGET) --smoke hipac_demo 20000000"
+	@echo "    smoke 例： ./$(TARGET) --smoke HiPAC2026crypto 100000000"
 	@echo ""
 
 # 編譯前先擋掉三種會讓人看不懂錯誤訊息的情況
@@ -118,7 +118,7 @@ info:
 	@echo "實際旗標       : $(CFLAGS) $(ARCH_FLAGS)"
 
 run: $(TARGET)
-	./$(TARGET) --smoke HiPAC2026crypto 20000000
+	./$(TARGET) --smoke HiPAC2026crypto 100000000
 
 clean:
 	rm -f $(TARGET) solution_*.csv

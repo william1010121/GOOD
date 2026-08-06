@@ -35,8 +35,8 @@ nonce_b = 18436129  →  429a8698aa53 757e2b88e18b43e4a445...
 
 1. **GPU 平行計算雜湊** —— 每個執行緒算一個 nonce 的 SHA-256，
    取雜湊的前 128 bits 當作排序鍵。
-2. **複製回 CPU 並排序** —— 用標準的 `qsort` 依雜湊值排序。
-3. **掃描相鄰配對** —— 排序後相鄰的兩筆最可能有長共同前綴，掃一遍找最佳。
+2. **GPU radix sort** —— 用 CUB stable radix sort 先排低 64 bits、再排高 64 bits。
+3. **GPU 相鄰配對 reduction** —— 在 GPU 找出本 batch 最佳配對，CPU 只拷回一筆 candidate。
 
 > 這支範本**能跑，但沒有特別快**。讓它更快就是你的任務。
 
@@ -82,13 +82,13 @@ nvcc -O3 -Xcompiler -fopenmp -arch=sm_90 collision.cu -o collision
 一般模式不使用 `total`，會持續以固定 batch 掃描，直到收到 `Ctrl-C`；每批完成後會回報目前找到的最高共同前綴 qbit 數量。每批大小可用 `BATCH_NONCES` 調整：
 
 ```bash
-BATCH_NONCES=20000000 ./collision HiPAC2026crypto
+BATCH_NONCES=100000000 ./collision HiPAC2026crypto
 ```
 
 只有明確加上 `--smoke` 才使用固定的 `total`，並在完成後結束：
 
 ```bash
-./collision --smoke HiPAC2026crypto 20000000
+./collision --smoke HiPAC2026crypto 100000000
 ```
 
 ### Slurm 1 分鐘 smoke test
@@ -96,7 +96,7 @@ BATCH_NONCES=20000000 ./collision HiPAC2026crypto
 `smoke_test.slurm` 會先編譯，再以 2 個 node、每個 node 8 張 GPU（共 16 張）執行 `--smoke`，重複完成固定大小的掃描批次直到達到 60 秒，最後輸出整體彙總吞吐量與目前最高 qbit 前綴：
 
 ```bash
-sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,SMOKE_SECONDS=60 smoke_test.slurm
+sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=100000000,SMOKE_SECONDS=60 smoke_test.slurm
 ```
 
 若叢集沒有自動找到 CUDA，可設定 `CUDA_MODULE`；若要指定 GPU 架構，可設定 `ARCH=sm_90`。工作目錄預設使用 `SLURM_SUBMIT_DIR`，也可用 `WORKDIR` 覆寫。
@@ -105,23 +105,21 @@ sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,SMOKE_SECONDS=6
 
 ```
 使用 GPU: NVIDIA H200（132 個 SM）
-prefix = "hipac_demo"    掃描 20000000 個 nonce
+prefix = "HiPAC2026crypto"    每批掃描 100000000 個 nonce
 
-需要記憶體：GPU 0.48 GB，CPU 0.96 GB
+需要記憶體：GPU 約 16 GB（含 CUB sort/reduce temp），CPU 只有一筆 candidate
 
-[1/3] GPU 計算 20000000 個雜湊 …
-[2/3] 複製回主機並排序 …
-[3/3] 掃描相鄰配對 …
+[batch 1] GPU 計算 100000000 個雜湊 …
+[batch 1] GPU radix sort（lo → hi）+ pair reduction …
 
-----------------------------------------
-最佳結果：共同前綴 51 bits
+目前最多共同前綴 qbit：51
 nonce_a : 13644422
 nonce_b : 18436129
-耗時    : 6 秒
+耗時    : 0.5 秒
 答案已寫入 solution_51.csv
 
 驗證指令：
-  python3 verify_collision.py -p hipac_demo -a 13644422 -b 18436129
+  python3 verify_collision.py -p HiPAC2026crypto -a 13644422 -b 18436129
 ```
 
 ## 如何驗證答案

@@ -1,0 +1,12 @@
+NVCC ?= /usr/local/cuda/bin/nvcc
+MPIDIR ?= /usr/mpi/gcc/openmpi-4.1.9a1
+ARCH ?= sm_90
+
+all: collision_hybrid
+
+collision_hybrid: collision_hybrid.cu
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xcompiler -fopenmp \
+		-I$(MPIDIR)/include -L$(MPIDIR)/lib collision_hybrid.cu \
+		-o $@ -lmpi
+
+.PHONY: all

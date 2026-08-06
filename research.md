@@ -8,7 +8,7 @@
 | `6475841` | 新增單 GPU Slurm smoke、GPU timing 與吞吐量回報。 | Job `480`：單張 H200，220M nonce / 62 秒，整體 **3.55 MH/s**；GPU hash **10.32–10.83 GH/s**。 | **51 qbit** |
 | `1b0b1d8` | 加入 continuous 模式、`--smoke`、`--start`、2 nodes × 8 GPUs 與 qbit 進度回報。 | Job `485`：16 GPU，2.24B nonce / 66 秒，aggregate **33.94 MH/s**，平均每 GPU **2.12 MH/s**。 | **55 qbit** |
 | `2cd1427` | 新增 `research.md`，記錄前一輪 smoke 結果。 | 沿用 Job `480`：**3.55 MH/s**，220M nonce / 62 秒。沒有新增測試。 | **51 qbit** |
-| `9750d50` | 將 CPU `qsort` 改成 CUB GPU stable radix sort，排序後只拷回一次結果。 | Job `491` 已提交，但目前仍在 Slurm 排隊，尚無有效優化後吞吐量。 | 尚未記錄 |
+| `9750d50` | 將 CPU `qsort` 改成 CUB GPU stable radix sort，排序後只拷回一次結果。 | Job `491`：16 GPU，4.48B nonce / 63 秒，aggregate **71.11 MH/s**，平均每 GPU **4.44 MH/s**。 | **55 qbit** |
 
 ## 已完成 smoke 詳情
 
@@ -37,4 +37,15 @@
 
 ### Job 491 — GPU radix sort
 
-Job `491` 使用 `9750d50` 的 CUB GPU radix sort 版本，prefix 為 `HiPAC2026crypto`，目前仍在等待 Slurm 資源，因此結果欄位暫不填入推測值。
+- Nodes: `team2server[1-2]`
+- GPU tasks: 16（2 nodes × 8 GPUs）
+- Prefix: `HiPAC2026crypto`
+- Workload: 14 runs × 16 ranks × 20,000,000 nonce = 4,480,000,000 nonce
+- Wall time: 63 seconds
+- Aggregate end-to-end throughput: **71.11 MH/s**
+- Average per-GPU throughput: **4.44 MH/s**
+- Per-rank completed-batch throughput: average **61.94 MH/s**, range **53.84–64.75 MH/s**
+- Best result: **55-bit common prefix**
+- Verification: passed with `verify_collision.py`
+
+Compared with Job `485` on the previous CPU `qsort` version, aggregate throughput improved from **33.94 MH/s** to **71.11 MH/s** (**2.10×**, approximately **109.5% faster**).

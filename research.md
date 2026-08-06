@@ -96,3 +96,17 @@ rank B: B1 ↔ B2 ↔ B3
 - Verification: passed with `verify_collision.py`
 
 The 295.38 MH/s figure includes repeated `srun` launch overhead from the smoke harness. The per-batch figure is the more useful algorithm-path measurement. Compared with Job `491` (20M batch, CPU candidate scan, 61.94 MH/s per completed batch), Job `503` is approximately **35.9×** faster on the completed batch path; the scheduler-level aggregate is approximately **4.15×** higher than Job `491` because 100M batches also amortize launch overhead.
+
+### Job 506 — one `srun`, continuous 60-second smoke
+
+- Nodes: `team2server[1-2]`
+- GPU tasks: 16（2 nodes × 8 GPUs）
+- Prefix: `HiPAC2026crypto`
+- Workload: 2,099,900,000,000 evaluated nonce / 61 seconds
+- Aggregate throughput: **34,424.59 MH/s**
+- Average per-GPU throughput: **2,151.54 MH/s**
+- Live GPU utilization: approximately **83–100%**
+- Best local result: **69 qbit**
+- Verification: passed with `verify_collision.py`
+
+Compared with Job `504`, using one long-running `srun` removed repeated launch gaps and made the GPU utilization representative. The 69 qbit value is still the maximum among rank-local candidates, not an exact cross-rank global maximum.

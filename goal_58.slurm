@@ -15,6 +15,7 @@ PREFIX="${PREFIX:-HiPAC2026crypto}"
 GOAL_BITS="${GOAL_BITS:-58}"
 # Slurm job limit 是 5 分鐘，預留 15 秒收集各 rank 的結果。
 SEARCH_SECONDS="${SEARCH_SECONDS:-285}"
+BATCH_NONCES="${BATCH_NONCES:-100000000}"
 TASKS="${SLURM_NTASKS:-16}"
 
 if [[ "${TASKS}" -ne 16 ]]; then
@@ -73,7 +74,7 @@ fi
 WORKDIR="${WORKDIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 RUN_ROOT="${WORKDIR}/.goal58-${SLURM_JOB_ID}"
 mkdir -p "${RUN_ROOT}"
-export WORKDIR PREFIX RUN_ROOT SEARCH_SECONDS
+export WORKDIR PREFIX RUN_ROOT SEARCH_SECONDS BATCH_NONCES
 
 echo "=== formal goal search ==="
 echo "prefix=${PREFIX}, goal_bits=${GOAL_BITS}, nodes=2, gpus=16"
@@ -90,7 +91,8 @@ srun --ntasks=16 --ntasks-per-node=8 --gpus-per-task=1 \
         cd "${rank_dir}"
         set +e
         timeout --signal=INT --kill-after=8s "${SEARCH_SECONDS}s" \
-            "${WORKDIR}/collision" --start "$((SLURM_PROCID * 1000000000000))" "${PREFIX}"
+            env BATCH_NONCES="${BATCH_NONCES}" "${WORKDIR}/collision" \
+            --start "$((SLURM_PROCID * 1000000000000))" "${PREFIX}"
         rc=$?
         set -e
         if [[ "${rc}" -ne 0 && "${rc}" -ne 124 && "${rc}" -ne 130 ]]; then

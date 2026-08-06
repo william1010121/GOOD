@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-# 可用 sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=20000000,
+# 可用 sbatch --export=ALL,PREFIX=HiPAC2026crypto,SMOKE_NONCES=100000000,
 #   SMOKE_SECONDS=60 smoke_test.slurm 覆寫。
 PREFIX="${PREFIX:-HiPAC2026crypto}"
-SMOKE_NONCES="${SMOKE_NONCES:-20000000}"
+SMOKE_NONCES="${SMOKE_NONCES:-100000000}"
 SMOKE_SECONDS="${SMOKE_SECONDS:-60}"
 
 if ! [[ "${SMOKE_NONCES}" =~ ^[0-9]+$ && "${SMOKE_NONCES}" -gt 0 ]]; then
@@ -78,7 +78,7 @@ fi
 WORKDIR="${WORKDIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 RUN_ROOT="${WORKDIR}/.slurm-smoke-${SLURM_JOB_ID}"
 mkdir -p "${RUN_ROOT}"
-export WORKDIR PREFIX SMOKE_NONCES RUN_ROOT
+export WORKDIR PREFIX SMOKE_NONCES RUN_ROOT TASKS
 
 start_epoch="$(date +%s)"
 deadline=$((start_epoch + SMOKE_SECONDS))
@@ -105,7 +105,8 @@ while true; do
             rank_dir="${RUN_ROOT}/run-${RUN_INDEX}/rank-${SLURM_PROCID}"
             mkdir -p "${rank_dir}"
             cd "${rank_dir}"
-            exec "${WORKDIR}/collision" --smoke --start "$((SLURM_PROCID * SMOKE_NONCES))" "${PREFIX}" "${SMOKE_NONCES}"
+            start_nonce="$((RUN_INDEX * TASKS * SMOKE_NONCES + SLURM_PROCID * SMOKE_NONCES))"
+            exec "${WORKDIR}/collision" --smoke --start "${start_nonce}" "${PREFIX}" "${SMOKE_NONCES}"
         '
     runs=$((runs + 1))
     total_nonces=$((total_nonces + TASKS * SMOKE_NONCES))
@@ -142,5 +143,7 @@ echo "completed_runs=${runs}"
 echo "completed_nonces=${total_nonces}"
 echo "elapsed_seconds=${elapsed}"
 echo "current_max_qbit_prefix=${max_qbit}"
+echo "global_best_scope=best among rank-local candidates"
+echo "global_best_source=${best_file:-none}"
 awk -v n="${total_nonces}" -v s="${elapsed}" -v g="${TASKS}" \
     'BEGIN { printf "aggregate_throughput=%.2f MH/s (16 GPUs, completed nonce / wall time)\nper_gpu_throughput=%.2f MH/s\n", n / s / 1000000, n / s / 1000000 / g }'

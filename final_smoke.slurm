@@ -16,13 +16,14 @@ export PMIX_MCA_gds=hash
 
 TOTAL="${TOTAL:-2000000000}"
 PREFIX="${PREFIX:-HiPAC2026crypto}"
+START_NONCE="${START_NONCE:-0}"
 cd "${SLURM_SUBMIT_DIR}"
 
 make -f Makefile.hybrid -B
 rm -f solution_*.csv
 echo "=== hybrid smoke: total=${TOTAL}, 2 nodes x 8 GPUs ==="
 timeout 580 srun --mpi=pmix -n 2 --ntasks-per-node=1 \
-    ./collision_hybrid "${PREFIX}" "${TOTAL}"
+    ./collision_hybrid "${PREFIX}" "${TOTAL}" 8 "${START_NONCE}"
 
 best="$(ls -1 solution_*.csv | sort -t_ -k2 -n | tail -1)"
 python3 verify_collision.py --file "${best}"

@@ -432,12 +432,14 @@ int main(int argc, char **argv) {
     int avail = 0; CUDA_CHECK(cudaGetDeviceCount(&avail));
     if (avail < 1) { fprintf(stderr, "找不到 GPU\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
     int G = (argc > 3) ? atoi(argv[3]) : avail;
+    uint64_t global_start = (argc > 4) ? strtoull(argv[4], NULL, 10) : 0ULL;
     if (G < 1) G = 1; if (G > avail) G = avail;
     MPI_Allreduce(MPI_IN_PLACE, &G, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     int n_scan = 1, bits_g = 0; while (n_scan * 2 <= G) { n_scan *= 2; bits_g++; }
 
     uint64_t pr = total / (uint64_t)ws, rr = total % (uint64_t)ws;
-    uint64_t my_start = (uint64_t)wr * pr + ((uint64_t)wr < rr ? (uint64_t)wr : rr);
+    uint64_t my_start = global_start + (uint64_t)wr * pr
+                      + ((uint64_t)wr < rr ? (uint64_t)wr : rr);
     uint64_t my_count = pr + ((uint64_t)wr < rr ? 1 : 0);
     if (!my_count) { fprintf(stderr, "total 太小\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
     if ((uint64_t)G > my_count) G = (int)my_count;
@@ -446,8 +448,9 @@ int main(int argc, char **argv) {
     build_base_words(prefix, base_words, &nw, &nsft);
 
     if (!wr) {
-        printf("prefix = \"%s\"    掃描 %llu 個 nonce    %d 節點 x %d GPU\n",
-               prefix, (unsigned long long)total, ws, G);
+        printf("prefix = \"%s\"    起點 %llu    掃描 %llu 個 nonce    %d 節點 x %d GPU\n",
+               prefix, (unsigned long long)global_start,
+               (unsigned long long)total, ws, G);
         printf("每筆 %zu bytes（v5）  主機每節點約 %.0f GB   裝置每卡約 %.0f GB\n\n",
                sizeof(E16),
                (double)my_count * sizeof(E16) * (2.0 - 1.0 / ws) / 1e9,
